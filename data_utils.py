@@ -9,7 +9,14 @@ EMOTION_COLS = [
 ]
 
 
-def load_fer2013_csv(img_csv_path, label_csv_path):
+def load_fer2013_csv(img_csv_path, label_csv_path, return_soft_labels=False):
+    """
+    Đọc và tiền xử lý bộ dữ liệu FER2013 kết hợp nhãn đám đông FER+ (Barsoum et al., 2016).
+    - Nếu return_soft_labels=False: trả về (X, y_hard) như cũ để tương thích ngược.
+    - Nếu return_soft_labels=True: trả về (X, y_soft, y_hard) trong đó:
+        + y_soft: phân phối xác suất 8 cảm xúc (float32, tổng = 1.0) dùng để train với Soft Label / KLDivLoss.
+        + y_hard: nhãn đa số (int64) dùng để tính Accuracy, Macro F1, Weighted F1 và Sampler.
+    """
     df_img = pd.read_csv(img_csv_path)
     df_label = pd.read_csv(label_csv_path)
 
@@ -58,9 +65,9 @@ def load_fer2013_csv(img_csv_path, label_csv_path):
     if missing:
         raise ValueError(f"Thiếu cột bắt buộc: {sorted(missing)}")
 
-    X_train, y_train = [], []
-    X_val, y_val = [], []
-    X_test, y_test = [], []
+    X_train, y_train_soft, y_train_hard = [], [], []
+    X_val, y_val_soft, y_val_hard = [], [], []
+    X_test, y_test_soft, y_test_hard = [], [], []
 
     ignored_usage = 0
     dropped_no_votes = 0
@@ -79,14 +86,15 @@ def load_fer2013_csv(img_csv_path, label_csv_path):
             continue
 
         # FER+ cung cấp phiếu bầu cho 8 cảm xúc.
-        votes = row[EMOTION_COLS].to_numpy(dtype=int).copy()
+        votes = row[EMOTION_COLS].to_numpy(dtype=np.float32).copy()
         unknown_votes = int(row["unknown"]) if "unknown" in df.columns else 0
         nf_votes = int(row["NF"]) if "NF" in df.columns else 0
 
-        # Bỏ các cảm xúc chỉ có 0 hoặc 1 phiếu.
-        votes[votes <= 1] = 0
+        # Bỏ các cảm xúc chỉ có 0 hoặc 1 phiếu (lọc nhiễu theo Barsoum et al., 2016).
+        votes[votes <= 1] = 0.0
 
-        if votes.sum() == 0:
+        total_votes = votes.sum()
+        if total_votes == 0:
             dropped_no_votes += 1
             continue
 
@@ -108,18 +116,23 @@ def load_fer2013_csv(img_csv_path, label_csv_path):
         image = (image.astype(np.float32) / 255.0 - 0.5) / 0.5
         image = image[..., np.newaxis]
 
-        # Nhãn cuối cùng là cảm xúc có số phiếu cao nhất sau khi lọc.
-        label = int(np.argmax(votes))
+        # 1. Phân phối xác suất nhãn mềm (Soft Label Distribution - Barsoum et al., 2016)
+        soft_probs = votes / total_votes
+        # 2. Nhãn cứng (Majority Voting) để phục vụ thống kê và đánh giá F1-Score
+        hard_label = int(np.argmax(votes))
 
         if usage == "Training":
             X_train.append(image)
-            y_train.append(label)
+            y_train_soft.append(soft_probs)
+            y_train_hard.append(hard_label)
         elif usage == "PublicTest":
             X_val.append(image)
-            y_val.append(label)
+            y_val_soft.append(soft_probs)
+            y_val_hard.append(hard_label)
         else:  # PrivateTest
             X_test.append(image)
-            y_test.append(label)
+            y_test_soft.append(soft_probs)
+            y_test_hard.append(hard_label)
 
     label_names = [
         "Neutral", "Happiness", "Surprise", "Sadness",
@@ -133,9 +146,9 @@ def load_fer2013_csv(img_csv_path, label_csv_path):
             for i in range(len(label_names))
         )
         print(f"{split_name}: {len(labels):,} ảnh")
-        print(f"  Nhãn: {distribution}")
+        print(f"  Nhãn đa số: {distribution}")
 
-    kept_count = len(y_train) + len(y_val) + len(y_test)
+    kept_count = len(y_train_hard) + len(y_val_hard) + len(y_test_hard)
 
     print("\n=== KẾT QUẢ LỌC VÀ CHIA TẬP ===")
     print(f"Bỏ qua do Usage không thuộc 3 tập: {ignored_usage:,}")
@@ -143,12 +156,19 @@ def load_fer2013_csv(img_csv_path, label_csv_path):
     print(f"Bị loại vì unknown/NF >= cảm xúc cao nhất: {dropped_unknown_nf:,}")
     print(f"Tổng ảnh được giữ trong 3 tập: {kept_count:,}")
 
-    print_split_stats("Train", y_train)
-    print_split_stats("Validation", y_val)
-    print_split_stats("Test", y_test)
+    print_split_stats("Train", y_train_hard)
+    print_split_stats("Validation", y_val_hard)
+    print_split_stats("Test", y_test_hard)
+
+    if return_soft_labels:
+        return (
+            (np.asarray(X_train), np.asarray(y_train_soft, dtype=np.float32), np.asarray(y_train_hard, dtype=np.int64)),
+            (np.asarray(X_val), np.asarray(y_val_soft, dtype=np.float32), np.asarray(y_val_hard, dtype=np.int64)),
+            (np.asarray(X_test), np.asarray(y_test_soft, dtype=np.float32), np.asarray(y_test_hard, dtype=np.int64)),
+        )
 
     return (
-        (np.asarray(X_train), np.asarray(y_train)),
-        (np.asarray(X_val), np.asarray(y_val)),
-        (np.asarray(X_test), np.asarray(y_test)),
+        (np.asarray(X_train), np.asarray(y_train_hard, dtype=np.int64)),
+        (np.asarray(X_val), np.asarray(y_val_hard, dtype=np.int64)),
+        (np.asarray(X_test), np.asarray(y_test_hard, dtype=np.int64)),
     )
