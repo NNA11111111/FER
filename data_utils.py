@@ -1,5 +1,3 @@
-from pathlib import Path
-
 import cv2
 import numpy as np
 import pandas as pd
@@ -15,7 +13,11 @@ def load_fer2013_csv(img_csv_path, label_csv_path):
     df_img = pd.read_csv(img_csv_path)
     df_label = pd.read_csv(label_csv_path)
 
-    # Ghép bằng ID nếu cả hai file đều có cột ID chung.
+    print("=== THỐNG KÊ DỮ LIỆU ĐẦU VÀO ===")
+    print(f"Ảnh trong fer2013.csv: {len(df_img):,} dòng")
+    print(f"Nhãn trong fer2013new.csv: {len(df_label):,} dòng")
+
+    # Ghép bằng ID nếu cả hai file có cột ID chung.
     common_id_cols = [
         col for col in ("image_id", "id")
         if col in df_img.columns and col in df_label.columns
@@ -23,6 +25,7 @@ def load_fer2013_csv(img_csv_path, label_csv_path):
 
     if common_id_cols:
         id_col = common_id_cols[0]
+
         if df_img[id_col].duplicated().any() or df_label[id_col].duplicated().any():
             raise ValueError(f"Cột ID '{id_col}' có giá trị trùng.")
 
@@ -32,16 +35,23 @@ def load_fer2013_csv(img_csv_path, label_csv_path):
             how="left",
             validate="one_to_one",
         )
+
         if df["pixels"].isna().any():
             raise ValueError("Một số nhãn không tìm thấy ảnh tương ứng.")
+
+        print(f"Đã ghép ảnh và nhãn bằng cột ID: {id_col}")
     else:
-        # Không có ID: chỉ có thể kiểm tra số dòng, không xác minh được thứ tự.
+        # Không có ID chung: ghép theo thứ tự dòng.
         if len(df_img) != len(df_label):
             raise ValueError(
-                f"Số dòng không khớp: ảnh={len(df_img)}, nhãn={len(df_label)}."
+                "Không thể ghép dữ liệu: số dòng không khớp "
+                f"(ảnh={len(df_img)}, nhãn={len(df_label)})."
             )
+
         df = df_label.copy()
         df["pixels"] = df_img["pixels"].to_numpy()
+
+        print("Ghép ảnh và nhãn theo thứ tự dòng (hai file không có ID chung).")
 
     required = {"Usage", "pixels", *EMOTION_COLS}
     missing = required - set(df.columns)
@@ -52,42 +62,90 @@ def load_fer2013_csv(img_csv_path, label_csv_path):
     X_val, y_val = [], []
     X_test, y_test = [], []
 
+    ignored_usage = 0
+    dropped_no_votes = 0
+    dropped_unknown_nf = 0
+
     clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(4, 4))
 
+    valid_usages = {"Training", "PublicTest", "PrivateTest"}
+
     for _, row in df.iterrows():
+        usage = row["Usage"]
+
+        # Không đưa Other hoặc Usage lạ vào train/validation/test.
+        if usage not in valid_usages:
+            ignored_usage += 1
+            continue
+
+        # FER+ cung cấp phiếu bầu cho 8 cảm xúc.
         votes = row[EMOTION_COLS].to_numpy(dtype=int).copy()
         unknown_votes = int(row["unknown"]) if "unknown" in df.columns else 0
         nf_votes = int(row["NF"]) if "NF" in df.columns else 0
 
+        # Bỏ các cảm xúc chỉ có 0 hoặc 1 phiếu.
         votes[votes <= 1] = 0
+
         if votes.sum() == 0:
+            dropped_no_votes += 1
             continue
 
         max_vote = votes.max()
+
+        # Bỏ ảnh nếu unknown hoặc NF có số phiếu bằng/vượt cảm xúc cao nhất.
         if max_vote <= unknown_votes or max_vote <= nf_votes:
+            dropped_unknown_nf += 1
             continue
 
         pixels = np.fromstring(row["pixels"], sep=" ", dtype=np.uint8)
         if pixels.size != 48 * 48:
-            raise ValueError(f"Ảnh có {pixels.size} pixel; cần đúng {48 * 48}.")
+            raise ValueError(
+                f"Một ảnh có {pixels.size} pixel; cần đúng {48 * 48}."
+            )
 
         image = pixels.reshape(48, 48)
         image = clahe.apply(image)
         image = (image.astype(np.float32) / 255.0 - 0.5) / 0.5
         image = image[..., np.newaxis]
+
+        # Nhãn cuối cùng là cảm xúc có số phiếu cao nhất sau khi lọc.
         label = int(np.argmax(votes))
 
-        usage = row["Usage"]
         if usage == "Training":
             X_train.append(image)
             y_train.append(label)
         elif usage == "PublicTest":
             X_val.append(image)
             y_val.append(label)
-        elif usage == "PrivateTest":
+        else:  # PrivateTest
             X_test.append(image)
             y_test.append(label)
-        # Các giá trị khác, gồm "Other", không đưa vào ba tập này.
+
+    label_names = [
+        "Neutral", "Happiness", "Surprise", "Sadness",
+        "Anger", "Disgust", "Fear", "Contempt",
+    ]
+
+    def print_split_stats(split_name, labels):
+        counts = np.bincount(labels, minlength=len(EMOTION_COLS))
+        distribution = ", ".join(
+            f"{label_names[i]}={counts[i]:,}"
+            for i in range(len(label_names))
+        )
+        print(f"{split_name}: {len(labels):,} ảnh")
+        print(f"  Nhãn: {distribution}")
+
+    kept_count = len(y_train) + len(y_val) + len(y_test)
+
+    print("\n=== KẾT QUẢ LỌC VÀ CHIA TẬP ===")
+    print(f"Bỏ qua do Usage không thuộc 3 tập: {ignored_usage:,}")
+    print(f"Bị loại vì không còn phiếu cảm xúc > 1: {dropped_no_votes:,}")
+    print(f"Bị loại vì unknown/NF >= cảm xúc cao nhất: {dropped_unknown_nf:,}")
+    print(f"Tổng ảnh được giữ trong 3 tập: {kept_count:,}")
+
+    print_split_stats("Train", y_train)
+    print_split_stats("Validation", y_val)
+    print_split_stats("Test", y_test)
 
     return (
         (np.asarray(X_train), np.asarray(y_train)),
