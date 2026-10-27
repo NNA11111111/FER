@@ -1,12 +1,13 @@
 import cv2
 import torch
+import torch.nn.functional as F
 import numpy as np
-import torchvision.transforms as transforms
+from collections import deque
 
 # Import kiến trúc mạng CNN của bạn
 from models import CustomCNN
 
-# Cập nhật từ điển 8 lớp theo đúng chuẩn FER+ thống nhất toàn dự án
+# Từ điển 8 lớp theo đúng chuẩn FER+ thống nhất toàn dự án
 EMOTION_DICT = {
     0: 'Neutral', 
     1: 'Happiness', 
@@ -20,20 +21,21 @@ EMOTION_DICT = {
 
 def preprocess_live_frame(face_crop):
     """
-    Áp dụng chính xác Pipeline tiền xử lý cho khung ảnh cắt từ Webcam.
+    Áp dụng chính xác Pipeline tiền xử lý cho khung ảnh cắt từ Webcam
+    theo đúng thứ tự trong data_utils.py: Grayscale -> Resize(48, 48) -> CLAHE -> Norm [-1.0, 1.0].
     """
-    # 1. Định hình kích thước 48x48
-    face_resized = cv2.resize(face_crop, (48, 48))
-    
-    # 2. Đảm bảo ảnh xám 1 kênh
-    if len(face_resized.shape) == 3:
-        face_gray = cv2.cvtColor(face_resized, cv2.COLOR_BGR2GRAY)
+    # 1. Đảm bảo chuyển sang ảnh xám 1 kênh trước
+    if len(face_crop.shape) == 3:
+        face_gray = cv2.cvtColor(face_crop, cv2.COLOR_BGR2GRAY)
     else:
-        face_gray = face_resized
+        face_gray = face_crop
+        
+    # 2. Định hình kích thước về chuẩn 48x48
+    face_resized = cv2.resize(face_gray, (48, 48))
         
     # 3. Cân bằng sáng cục bộ (CLAHE)
     clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(4, 4))
-    face_clahe = clahe.apply(face_gray)
+    face_clahe = clahe.apply(face_resized)
     
     # 4. Chuẩn hóa Pixel về [-1.0, 1.0]
     X = face_clahe.astype(np.float32) / 255.0
@@ -44,7 +46,7 @@ def preprocess_live_frame(face_crop):
     
     return tensor_img
 
-def run_realtime_inference(model_path="best_model.pth"):
+def run_realtime_inference(model_path="best.pth"):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Đang sử dụng thiết bị: {device}")
     
@@ -61,6 +63,9 @@ def run_realtime_inference(model_path="best_model.pth"):
 
     # Khởi tạo Face Detector của OpenCV (HaarCascade)
     face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
+    
+    # Hàng đợi lưu 5 vector xác suất Softmax gần nhất để làm mượt dự đoán
+    prob_queue = deque(maxlen=5)
     
     # Mở Webcam
     cap = cv2.VideoCapture(0)
@@ -84,15 +89,20 @@ def run_realtime_inference(model_path="best_model.pth"):
             # 3. Tiền xử lý
             tensor_input = preprocess_live_frame(face_crop).to(device)
             
-            # 4. Dự đoán cảm xúc
+            # 4. Dự đoán cảm xúc kết hợp bộ lọc trung bình trượt 5 frame
             with torch.no_grad():
                 outputs = model(tensor_input)
-                pred_idx = torch.argmax(outputs, dim=1).item()
-                emotion_label = EMOTION_DICT[pred_idx]
+                probs = F.softmax(outputs, dim=1).cpu().numpy()[0]
+                prob_queue.append(probs)
+                
+                avg_probs = np.mean(prob_queue, axis=0)
+                pred_idx = int(np.argmax(avg_probs))
+                confidence = avg_probs[pred_idx] * 100
+                display_text = f"{EMOTION_DICT[pred_idx]}: {confidence:.0f}%"
             
-            # 5. Vẽ khung vuông và in nhãn cảm xúc lên màn hình
+            # 5. Vẽ khung vuông và in nhãn cảm xúc kèm % độ tự tin lên màn hình
             cv2.rectangle(frame, (x, y), (x+w, y+h), (0, 255, 0), 2)
-            cv2.putText(frame, emotion_label, (x, y - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 255, 0), 2)
+            cv2.putText(frame, display_text, (x, y - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
             
         # Hiển thị Video
         cv2.imshow("Real-time FER+", frame)
