@@ -8,15 +8,15 @@ class FER2013Dataset(Dataset):
         self.y = y
         self.is_train = is_train
         
-        # Cấu hình Augmentation cho tập Train (đã giảm mức độ biến đổi để giữ cấu trúc mặt 48x48)
+        # Cấu hình Augmentation cho tập Train (giữ cấu trúc mặt 48x48)
         if self.is_train:
             self.transform = transforms.Compose([
                 # Co giãn ±10%, Dịch ±10%, Xoay ±10°
                 transforms.RandomAffine(degrees=10, translate=(0.1, 0.1), scale=(0.9, 1.1)),
                 # Lật ngang 50%
                 transforms.RandomHorizontalFlip(p=0.5),
-                # Xóa ngẫu nhiên với xác suất 25%, diện tích từ 2% đến 10%
-                transforms.RandomErasing(p=0.25, scale=(0.02, 0.1))
+                # Dùng pixel ngẫu nhiên để tránh vùng xám cố định trên ảnh đã chuẩn hóa [-1, 1].
+                transforms.RandomErasing(p=0.25, scale=(0.02, 0.1), value='random')
             ])
         else:
             self.transform = None
@@ -33,5 +33,11 @@ class FER2013Dataset(Dataset):
         if self.is_train:
             img_tensor = self.transform(img_tensor)
             
-        label = torch.tensor(self.y[idx], dtype=torch.long)
+        # Nhãn mềm là vector phân phối xác suất; nhãn cứng là số nguyên lớp.
+        target = self.y[idx]
+        if getattr(target, "ndim", 0) > 0:
+            label = torch.tensor(target, dtype=torch.float32)
+        else:
+            label = torch.tensor(target, dtype=torch.long)
+
         return img_tensor, label
