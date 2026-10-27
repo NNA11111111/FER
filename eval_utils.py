@@ -6,24 +6,18 @@ import seaborn as sns
 from sklearn.metrics import confusion_matrix, classification_report
 import numpy as np
 
-def ten_crop_inference(model, image_tensor, crop_size=42, target_size=48):
+def ten_crop_inference(model, image_tensor, pad_size=4, crop_size=48):
     """
-    Kỹ thuật Ten-Crop Averaging để tăng độ tin cậy khi đánh giá trên tập PrivateTest.
-    Đầu vào: 
-        - image_tensor: Tensor ảnh kích thước (1, 48, 48) hoặc (48, 48)
-    Đầu ra:
-        - predicted_label: Nhãn cảm xúc dự đoán
-        - avg_probs: Vector xác suất (7,) sau khi trung bình cộng
+    Kỹ thuật Ten-Crop Averaging chuẩn theo Pramerdorfer & Kampel (2016):
+    Đệm viền (Pad=4, reflect) đưa ảnh từ 48x48 lên 56x56, sau đó cắt TenCrop(48)
+    để giữ nguyên 100% tỷ lệ khuôn mặt và độ sắc nét của pixel (không dùng Resize).
     """
     device = next(model.parameters()).device
     
-    # TenCrop trả về 10 crops (4 góc, 1 tâm + 5 bản lật ngang).
-    # Resize các crop về lại target_size (48x48) để khớp với đầu vào của mạng CNN.
     ten_crop_transform = transforms.Compose([
+        transforms.Pad(padding=pad_size, padding_mode='reflect'),
         transforms.TenCrop(crop_size),
-        transforms.Lambda(lambda crops: torch.stack([
-            transforms.Resize((target_size, target_size))(crop) for crop in crops
-        ]))
+        transforms.Lambda(lambda crops: torch.stack([crop for crop in crops]))
     ])
     
     # Cắt và đưa lên thiết bị (GPU/CPU), chuyển thành shape: (10, 1, 48, 48)
@@ -84,7 +78,7 @@ def evaluate_private_test(y_true, y_pred, emotion_dict):
     labels = [emotion_dict[i] for i in range(len(emotion_dict))]
     
     print("=== BÁO CÁO KIỂM ĐỊNH (CLASSIFICATION REPORT) ===")
-    print(classification_report(y_true, y_pred, target_names=labels))
+    print(classification_report(y_true, y_pred, target_names=labels, digits=4))
     
     cm = confusion_matrix(y_true, y_pred)
     plt.figure(figsize=(10, 8))

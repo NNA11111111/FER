@@ -3,7 +3,7 @@ import numpy as np
 import cv2
 
 def load_fer2013_csv(img_csv_path, label_csv_path):
-    print("Đang ghép dữ liệu ảnh và nhãn FER+ (8 lớp)...")
+    print("Đang ghép dữ liệu ảnh và nhãn FER+ (8 lớp) và lọc nhiễu...")
     
     # Đọc file cũ lấy ảnh và file mới lấy nhãn
     df_img = pd.read_csv(img_csv_path)
@@ -27,9 +27,20 @@ def load_fer2013_csv(img_csv_path, label_csv_path):
     for _, row in df_label.iterrows():
         usage = row['Usage']
         
-        # FER+ dùng phương pháp voting, ta lấy cảm xúc có số phiếu bầu cao nhất làm nhãn chính
+        # Lấy mảng phiếu bầu của 8 cảm xúc và 2 cột nhiễu ('unknown', 'NF')
         votes = row[emotion_cols].values.astype(int)
-        emotion = np.argmax(votes) 
+        unknown_votes = int(row['unknown']) if 'unknown' in row else 0
+        nf_votes = int(row['NF']) if 'NF' in row else 0
+        
+        # Quy tắc lọc nhiễu của Barsoum et al. (2016) (Mục 5): xóa phiếu lẻ <= 1
+        votes[votes <= 1] = 0
+        
+        max_vote = np.max(votes)
+        # Bỏ qua ảnh rác nếu tổng phiếu 8 cảm xúc bằng 0 hoặc thua/bằng phiếu unknown hay NF
+        if np.sum(votes) == 0 or max_vote <= unknown_votes or max_vote <= nf_votes:
+            continue
+            
+        emotion = np.argmax(votes)
         
         pixels = np.fromstring(row['pixels'], sep=' ', dtype=np.uint8).reshape(48, 48)
         img_clahe = clahe.apply(pixels)
