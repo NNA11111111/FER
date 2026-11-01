@@ -12,6 +12,7 @@ A Python project for facial expression recognition on FER2013 images with FER+ c
 - `preprocessing.py`: shared CLAHE and normalization for training and webcam inference.
 - `test_data_utils.py`: synthetic-data checks for loading, splitting, and preprocessing.
 - `review.md`: code review notes for this revision.
+- `train-fer.ipynb`: training and evaluation workflow for Kaggle, including multiple seeds and checkpoint export.
 
 ## Requirements
 
@@ -48,7 +49,11 @@ python webcam_infer.py
 
 The webcam script expects a camera accessible as device 0. A `best_calibration.pt` file is optional; when available, its class priors and post-hoc adjustment settings are used. Model weights, FER data, and calibration files are not included in this repository.
 
-This repository currently provides reusable model/data/evaluation modules; it does not include a standalone training entry point.
+## Training
+
+Open `train-fer.ipynb` in Kaggle with the FER2013 image CSV (`fer2013.csv`), FER+ label CSV (`fer2013new.csv`), and repository Python modules available as inputs. Run its cells in order. The notebook locates those files, prepares deterministic splits, trains and evaluates the model, and saves checkpoints. Adjust paths and runtime settings in the notebook for a local environment.
+
+Generated checkpoints (`*.pth`, `*.pt`) and split reports are kept out of Git. Keep your own copies of those outputs if you need to reproduce inference or inspect a particular training run.
 
 ## Tests
 

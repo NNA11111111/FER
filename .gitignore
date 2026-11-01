@@ -1,1 +1,10 @@
 dataset/fer2013.csv
+*.pth
+*.pt
+all_splits.csv
+dedup_report.csv
+split_config.json
+train_ids.csv
+val_ids.csv
+test_ids.csv
+split_manifest/
