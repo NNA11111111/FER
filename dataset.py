@@ -7,10 +7,10 @@ import torchvision.transforms as transforms
 class FER2013Dataset(Dataset):
     """
     Dataset FER2013 / FER+ với thiết kế Augmentation bảo toàn vi biểu cảm (Micro-expression Safe)
-    kết hợp bảo vệ đặc biệt cho 3 lớp hiếm (Disgust=5, Fear=6, Contempt=7):
+    kết hợp bảo vệ cho 3 lớp hiếm (Disgust=5, Fear=6, Contempt=7):
     - Co giãn nhẹ ±8%, Dịch ±8%, Xoay ±10°, Lật ngang 50%.
     - TẮT RandomErasing đối với các mẫu thuộc 3 lớp hiếm (Disgust, Fear, Contempt) ngay trong __getitem__,
-      ngăn chặn 100% nguy cơ vùng xóa ngẫu nhiên che mất khoé miệng nhếch lệch của Contempt (AU12/AU14),
+      giúp giảm thiểu nguy cơ vùng xóa ngẫu nhiên che khuất khoé miệng nhếch lệch của Contempt (AU12/AU14),
       sống mũi nhăn của Disgust (AU9) hoặc vùng chân mày căng của Fear (AU1+2+4).
     - Hỗ trợ bật/tắt RandomErasing động qua set_erasing_enabled() giữa các giai đoạn huấn luyện.
     """
@@ -97,9 +97,9 @@ def mixup_soft_batch(
     Kỹ thuật Selective Mixup Bảo vệ Lớp Hiếm (Rare-Class Preserving Mixup):
     - Chỉ trộn với xác suất `p` (mặc định 40% số batch).
     - Đặc biệt: Đối với các mẫu trong batch có nhãn chính thuộc nhóm lớp hiếm `rare_classes`
-      (Disgust=5, Fear=6, Contempt=7), giữ nguyên hệ số trộn `lam = 1.0` (tức giữ nguyên 100% ảnh gốc
+      (Disgust=5, Fear=6, Contempt=7), giữ nguyên hệ số trộn `lam = 1.0` (tức giữ nguyên ảnh gốc
       và nhãn gốc, KHÔNG trộn với lớp đa số Neutral/Happiness).
-    - Điều này ngăn chặn triệt để hiện tượng vi biểu cảm của Disgust, Contempt, Fear bị pha loãng
+    - Điều này giúp hạn chế hiện tượng vi biểu cảm của Disgust, Contempt, Fear bị pha loãng
       với các khuôn mặt bình thản hoặc cười trong quá trình học.
     """
     if alpha <= 0.0 or p <= 0.0 or images.size(0) <= 1:

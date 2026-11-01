@@ -9,6 +9,8 @@ A Python project for facial expression recognition on FER2013 images with FER+ c
 - `models.py`: residual CNN with channel and spatial attention.
 - `eval_utils.py`: losses, class balancing, metrics, calibration, Grad-CAM, and evaluation helpers.
 - `webcam_infer.py`: real-time inference with a webcam and a compatible model checkpoint.
+- `preprocessing.py`: shared CLAHE and normalization for training and webcam inference.
+- `test_data_utils.py`: synthetic-data checks for loading, splitting, and preprocessing.
 - `review.md`: code review notes for this revision.
 
 ## Requirements
@@ -20,6 +22,8 @@ Python 3.9+ and the packages `numpy`, `pandas`, `opencv-python`, `scikit-learn`,
 Place FER2013 images and FER+ labels in CSV format locally. The loader expects an image CSV with `pixels`, and a label CSV with `Usage`, the eight emotion vote columns (`neutral`, `happiness`, `surprise`, `sadness`, `anger`, `disgust`, `fear`, `contempt`), and optionally `unknown` and `NF`. If both files share `image_id` or `id`, they are joined by that field; otherwise row order and row counts must match.
 
 The raw image CSV is excluded from Git by `.gitignore`. The loader defaults to a deterministic 70/15/15 stratified split, tie filtering, and perceptual-hash deduplication. Set `use_stratify=False` to use the original `Usage` partitions. `return_soft_labels=True` and `return_sample_weights=True` expose the corresponding training targets and weights.
+
+Set `split_manifest_dir` to write split manifests and a deduplication report. Use `load_split_from_manifest` to reload a recorded split. The shared preprocessing applies CLAHE to 48×48 grayscale images and scales values to [-1, 1].
 
 Example:
 
@@ -45,3 +49,7 @@ python webcam_infer.py
 The webcam script expects a camera accessible as device 0. A `best_calibration.pt` file is optional; when available, its class priors and post-hoc adjustment settings are used. Model weights, FER data, and calibration files are not included in this repository.
 
 This repository currently provides reusable model/data/evaluation modules; it does not include a standalone training entry point.
+
+## Tests
+
+Install `pytest` and run `python -m pytest test_data_utils.py` to check the data pipeline with synthetic inputs.

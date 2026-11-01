@@ -1,5 +1,6 @@
 from pathlib import Path
 import time
+import warnings
 from collections import deque
 import cv2
 import numpy as np
@@ -8,6 +9,7 @@ import torch.nn.functional as F
 
 from models import CustomCNN
 from eval_utils import apply_posthoc_logit_adjustment
+from preprocessing import preprocess_fer_gray_48x48
 
 EMOTION_DICT = {
     0: "Neutral",
@@ -20,33 +22,48 @@ EMOTION_DICT = {
     7: "Contempt",
 }
 
-# Phân phối tiên nghiệm chuẩn (Clean Stratified Class Priors pi_c) từ tập FER+ 70/15/15
 DEFAULT_CLASS_PRIORS = np.array(
     [0.3600, 0.2815, 0.1093, 0.1257, 0.0888, 0.0059, 0.0226, 0.0063],
     dtype=np.float32,
 )
-# Mặc định chỉ bù nhẹ 0.10 ở bước hậu nghiệm vì mô hình đã tích hợp stage1_tau=0.30 khi huấn luyện
 DEFAULT_POSTHOC_TAU = 0.10
+
+
+def shrink_face_bbox(x, y, w, h, frame_shape, crop_margin_shrink=0.0):
+    """
+    Tùy chọn thu nhỏ hộp giới hạn khuôn mặt Haar Cascade vào gần khung cắt kiểu FER2013.
+    Mặc định crop_margin_shrink=0.0 giữ nguyên hộp Haar hiện tại.
+    """
+    shrink = float(crop_margin_shrink)
+    if shrink <= 0.0:
+        return x, y, w, h
+
+    frame_h, frame_w = frame_shape[:2]
+    dx = int(round(w * shrink * 0.5))
+    dy = int(round(h * shrink * 0.5))
+
+    nx = max(0, x + dx)
+    ny = max(0, y + dy)
+    nw = max(1, min(frame_w - nx, w - 2 * dx))
+    nh = max(1, min(frame_h - ny, h - 2 * dy))
+    return nx, ny, nw, nh
 
 
 def preprocess_live_frame(face_crop):
     """
-    Áp dụng chính xác Pipeline tiền xử lý cho khung ảnh cắt từ Webcam
-    theo đúng thứ tự trong data_utils.py: Grayscale -> Resize(48, 48) -> CLAHE -> Norm [-1.0, 1.0].
+    Áp dụng chính xác hàm tiền xử lý dùng chung `preprocess_fer_gray_48x48` cho khung ảnh cắt từ Webcam:
+    Grayscale -> Resize(48, 48, INTER_AREA khi thu nhỏ) -> preprocess_fer_gray_48x48 (CLAHE + Norm [-1, 1]).
     """
     if len(face_crop.shape) == 3:
         face_gray = cv2.cvtColor(face_crop, cv2.COLOR_BGR2GRAY)
     else:
         face_gray = face_crop
 
-    face_resized = cv2.resize(face_gray, (48, 48))
+    h, w = face_gray.shape[:2]
+    interp = cv2.INTER_AREA if (h > 48 or w > 48) else cv2.INTER_LINEAR
+    face_resized = cv2.resize(face_gray, (48, 48), interpolation=interp)
 
-    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(4, 4))
-    face_clahe = clahe.apply(face_resized)
-
-    X = face_clahe.astype(np.float32) / 255.0
-    X_norm = (X - 0.5) / 0.5
-
+    X_norm = preprocess_fer_gray_48x48(face_resized)
     tensor_img = torch.tensor(X_norm, dtype=torch.float32).unsqueeze(0).unsqueeze(0)
     return tensor_img
 
@@ -119,49 +136,109 @@ class MultiFaceTracker:
 
 def load_compatible_custom_cnn(model_path, device):
     """
-    Tự động nạp trọng số cho CustomCNN: tương thích hoàn toàn với cả checkpoint mới
-    (có ECA + SpatialMicroAttention) lẫn checkpoint best.pth phiên bản cũ (chỉ có ResSEBlock).
+    Tự động nạp trọng số cho CustomCNN bằng weights_only=True:
+    Tương thích hoàn toàn với cả best_bundle.pth mới lẫn checkpoint best.pth cũ.
     """
     ckpt_data = torch.load(model_path, map_location=device, weights_only=True)
-    state_dict = ckpt_data["model_state_dict"] if (isinstance(ckpt_data, dict) and "model_state_dict" in ckpt_data) else ckpt_data
+    if isinstance(ckpt_data, dict) and "model_state_dict" in ckpt_data:
+        state_dict = ckpt_data["model_state_dict"]
+        use_eca = bool(ckpt_data.get("use_eca", any(".eca." in k for k in state_dict.keys())))
+        use_spatial = bool(ckpt_data.get("use_spatial_attn", any(".spatial_attn." in k for k in state_dict.keys())))
+    else:
+        state_dict = ckpt_data
+        use_eca = any(".eca." in k for k in state_dict.keys())
+        use_spatial = any(".spatial_attn." in k for k in state_dict.keys())
 
-    has_eca = any(".eca." in k for k in state_dict.keys())
-    has_spatial = any(".spatial_attn." in k for k in state_dict.keys())
-
-    model = CustomCNN(num_classes=8, use_eca=has_eca, use_spatial_attn=has_spatial)
+    model = CustomCNN(num_classes=8, use_eca=use_eca, use_spatial_attn=use_spatial)
     model.load_state_dict(state_dict, strict=True)
     return model, ckpt_data
 
 
+def _validate_priors(priors):
+    priors_arr = np.asarray(priors, dtype=np.float32).flatten()
+    assert len(priors_arr) == 8, f"class_priors phải có đúng 8 phần tử, nhận được {len(priors_arr)}!"
+    assert np.isclose(priors_arr.sum(), 1.0, atol=1e-2), (
+        f"Tổng của class_priors phải xấp xỉ 1.0, nhận được {priors_arr.sum():.4f}!"
+    )
+    return priors_arr
+
+
 def run_realtime_inference(
+    bundle_path="best_bundle.pth",
     model_path="best.pth",
     calibration_path="best_calibration.pt",
-    class_priors=DEFAULT_CLASS_PRIORS,
-    posthoc_tau=DEFAULT_POSTHOC_TAU,
+    class_priors=None,
+    posthoc_tau=None,
+    crop_margin_shrink=0.0,
 ):
     """
-    Chạy suy luận thời gian thực qua Webcam đồng bộ 100% với quy trình đánh giá (Evaluation).
+    Chạy suy luận thời gian thực qua Webcam đồng bộ với quy trình đánh giá Single-Crop:
+    - Ưu tiên nạp `best_bundle.pth` với `weights_only=True`.
+    - Nếu không có bundle, nạp `best.pth` và `best_calibration.pt` (chỉ dùng `weights_only=True`);
+      nếu lỗi hoặc thiếu calibration sẽ in CẢNH BÁO RÕ rồi dùng giá trị dự phòng.
+    - Kiểm tra (assert) `class_priors` có đúng 8 phần tử và tổng ~ 1.0.
+    - Hỗ trợ tham số tùy chọn `crop_margin_shrink` (mặc định 0.0).
     """
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Đang sử dụng thiết bị: {device}")
+    print(f"Cấu hình crop_margin_shrink={crop_margin_shrink:.3f} (0.0 = giữ nguyên hộp Haar)")
+
+    target_ckpt = bundle_path if Path(bundle_path).exists() else model_path
 
     try:
-        model, ckpt_data = load_compatible_custom_cnn(model_path, device)
-        if isinstance(ckpt_data, dict) and "model_state_dict" in ckpt_data:
-            class_priors = ckpt_data.get("class_priors", class_priors)
-            posthoc_tau = ckpt_data.get("posthoc_tau", posthoc_tau)
+        model, ckpt_data = load_compatible_custom_cnn(target_ckpt, device)
+        loaded_calib = False
 
-        if Path(calibration_path).exists():
-            calib_data = torch.load(calibration_path, map_location="cpu", weights_only=False)
-            class_priors = calib_data.get("class_priors", class_priors)
-            posthoc_tau = calib_data.get("posthoc_tau", posthoc_tau)
-            print(f"Đã nạp cấu hình hiệu chỉnh Logit từ '{calibration_path}'.")
+        if isinstance(ckpt_data, dict) and "model_state_dict" in ckpt_data:
+            print(f"Đã nạp bundle checkpoint từ '{target_ckpt}' (weights_only=True).")
+            if "class_priors" in ckpt_data and ("posthoc_tau_vec" in ckpt_data or "posthoc_tau" in ckpt_data):
+                class_priors = ckpt_data["class_priors"]
+                posthoc_tau = ckpt_data.get("posthoc_tau_vec", ckpt_data.get("posthoc_tau"))
+                loaded_calib = True
+
+        if not loaded_calib and Path(calibration_path).exists():
+            try:
+                calib_data = torch.load(calibration_path, map_location="cpu", weights_only=True)
+                if "class_priors" in calib_data and ("posthoc_tau" in calib_data or "posthoc_tau_vec" in calib_data):
+                    class_priors = calib_data["class_priors"]
+                    posthoc_tau = calib_data.get("posthoc_tau_vec", calib_data.get("posthoc_tau"))
+                    loaded_calib = True
+                    print(f"Đã nạp cấu hình hiệu chỉnh Logit từ '{calibration_path}' (weights_only=True).")
+            except Exception as calib_err:
+                warnings.warn(
+                    f"\n[CẢNH BÁO RÕ] Không thể nạp '{calibration_path}' với weights_only=True ({calib_err}). "
+                    "Bỏ qua file này và chuyển sang giá trị dự phòng an toàn."
+                )
+                print(
+                    f"\n[CẢNH BÁO RÕ] Lỗi khi đọc '{calibration_path}' với weights_only=True: {calib_err}. "
+                    "Đang chuyển sang dùng giá trị dự phòng."
+                )
+
+        if not loaded_calib:
+            if class_priors is None or posthoc_tau is None:
+                warnings.warn(
+                    "\n[CẢNH BÁO RÕ] Không tìm thấy thông tin calibration hợp lệ (class_priors / posthoc_tau_vec) "
+                    f"trong '{target_ckpt}' hoặc '{calibration_path}'! "
+                    "Đang tạm dùng DEFAULT_CLASS_PRIORS và DEFAULT_POSTHOC_TAU dự phòng. "
+                    "Hãy xuất best_bundle.pth từ notebook để đồng bộ chính xác với mô hình đã huấn luyện."
+                )
+                print(
+                    "\n[CẢNH BÁO RÕ] Thiếu dữ liệu calibration hợp lệ! "
+                    "Đang sử dụng DEFAULT_CLASS_PRIORS và DEFAULT_POSTHOC_TAU dự phòng."
+                )
+                if class_priors is None:
+                    class_priors = DEFAULT_CLASS_PRIORS
+                if posthoc_tau is None:
+                    posthoc_tau = DEFAULT_POSTHOC_TAU
+
+        class_priors = _validate_priors(class_priors)
+        posthoc_tau = np.asarray(posthoc_tau, dtype=np.float32)
 
         model.to(device)
         model.eval()
-        print("Tải trọng số thành công. Đang mở Webcam...")
+        print("Tải trọng số và xác thực priors (8 lớp, tổng ~ 1.0) thành công. Đang mở Webcam...")
     except Exception as e:
-        print(f"Lỗi: Không tìm thấy hoặc không thể đọc file '{model_path}'.\nChi tiết: {e}")
+        print(f"Lỗi: Không thể nạp mô hình từ '{target_ckpt}'.\nChi tiết: {e}")
         return
 
     face_cascade = cv2.CascadeClassifier(
@@ -191,8 +268,11 @@ def run_realtime_inference(
         if len(faces) > 0:
             batch_tensors = []
             for (x, y, w, h) in faces:
-                bboxes.append((x, y, w, h))
-                face_crop = gray_frame[y : y + h, x : x + w]
+                cx, cy, cw, ch = shrink_face_bbox(
+                    x, y, w, h, gray_frame.shape, crop_margin_shrink=crop_margin_shrink
+                )
+                bboxes.append((cx, cy, cw, ch))
+                face_crop = gray_frame[cy : cy + ch, cx : cx + cw]
                 batch_tensors.append(preprocess_live_frame(face_crop))
 
             batch_input = torch.cat(batch_tensors, dim=0).to(device)

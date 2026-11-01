@@ -22,10 +22,10 @@ def compute_smooth_class_weights(class_counts, power=0.25, max_ratio=3.0):
     """
     Tính trọng số lớp êm dịu theo luỹ thừa nghịch đảo (Smooth Inverse-Power Class Weights):
         w_c = (1 / n_c)^power, giới hạn tỷ lệ max(w)/min(w) <= max_ratio.
-    Khắc phục triệt để lỗi trọng số quá gắt (gấp 12.3 lần ở phiên bản cũ với beta=0.997)
-    vốn làm sụp đổ Precision của Disgust và Contempt ở Giai đoạn 2.
+    Giúp khắc phục vấn đề trọng số quá gắt (gấp 12.3 lần ở phiên bản cũ với beta=0.997)
+    vốn làm giảm mạnh Precision của Disgust và Contempt ở Giai đoạn 2.
     Với power=0.25 trên FER+, trọng số của Disgust/Contempt chỉ gấp ~2.7 lần Neutral,
-    giúp tăng Recall lớp hiếm mà vẫn giữ Precision cao.
+    giúp cải thiện Recall lớp hiếm mà vẫn duy trì Precision.
     """
     counts = np.maximum(np.asarray(class_counts, dtype=np.float64), 1.0)
     raw_weights = np.power(1.0 / counts, power)
@@ -38,7 +38,7 @@ def compute_smooth_class_weights(class_counts, power=0.25, max_ratio=3.0):
 def compute_effective_number_weights(class_counts, beta=0.99, max_ratio=3.2):
     """
     Tính trọng số lớp theo Số lượng Mẫu Hiệu dụng (Cui et al., CVPR 2019)
-    CÓ GIỚI HẠN TỶ LỆ TỐI ĐA (max_ratio=3.2) để ngăn chặn hiện tượng bùng nổ False Positives
+    CÓ GIỚI HẠN TỶ LỆ TỐI ĐA (max_ratio=3.2) để hạn chế hiện tượng tăng False Positives
     trên các lớp cực hiếm (Disgust, Contempt).
     """
     counts = np.maximum(np.asarray(class_counts, dtype=np.float64), 1.0)
@@ -78,13 +78,13 @@ def get_cosine_gamma(epoch, total_epochs, warmup_epochs=12, max_gamma=0.35):
 class SoftWeightedKLDivLoss(nn.Module):
     r"""
     Hàm mất mát Sample-Level Focal KL-Divergence trên nhãn mềm 10 phiếu (FER+) đã sửa lỗi lệch xác suất:
-    1. Khắc phục lỗi ở phiên bản cũ: Phiên bản cũ nhân `(1 - probs)^gamma` riêng lẻ vào từng lớp `c`,
-       làm triệt tiêu đạo hàm của cảm xúc chính và phóng đại nhiễu của cảm xúc phụ khi gamma tăng cao sau Epoch 30.
+    1. Khắc phục hạn chế ở phiên bản cũ: Phiên bản cũ nhân `(1 - probs)^gamma` riêng lẻ vào từng lớp `c`,
+       làm suy giảm đạo hàm của cảm xúc chính và phóng đại nhiễu của cảm xúc phụ khi gamma tăng cao sau Epoch 30.
     2. Phiên bản mới tính hệ số điều biến Focal ở MỨC TOÀN MẪU (Sample-Level Alignment):
            p_align = \sum_{c=1}^C y_c \cdot p_c
            focal_factor = (1 - p_align)^\gamma
        Nhờ nhân cùng một hệ số `focal_factor` cho cả vector nhãn mềm của mẫu `i`, tỷ lệ xác suất mục tiêu
-       giữa 8 lớp được bảo toàn tuyệt đối (strictly proper scoring rule), giúp mạng học càng lâu càng chính xác!
+       giữa 8 lớp được bảo toàn (strictly proper scoring rule).
     3. Hỗ trợ Logit Adjustment trong lúc huấn luyện (`logit_adj_tau`) và Trọng số mẫu đám đông (`sample_weights`).
     """
     def __init__(self, class_weights=None, class_priors=None, logit_adj_tau=0.0, gamma=0.0):
@@ -136,7 +136,6 @@ class SoftWeightedKLDivLoss(nn.Module):
 
         loss_per_sample = kl_per_class.sum(dim=1)
 
-        # Điều biến Focal ở mức toàn mẫu (giữ nguyên tính chuẩn xác suất của KL-Divergence)
         if self.gamma > 0.0:
             p_align = (soft_targets * probs).sum(dim=1)
             one_minus_p = torch.clamp(1.0 - p_align, min=1e-6, max=1.0)
@@ -166,7 +165,7 @@ def apply_posthoc_logit_adjustment(logits, class_priors, tau=0.10):
     Hiệu chỉnh Logit Hậu nghiệm (Post-hoc Logit Adjustment - Menon et al., ICLR 2021):
         \tilde{z}_c = z_c - \tau_c \ln \pi_c
     Lưu ý: Nếu trong lúc train đã dùng `stage1_tau` (ví dụ 0.30), thì `posthoc_tau` chỉ cần đặt nhỏ
-    (ví dụ 0.10) để tránh cộng chồng làm bùng nổ False Positives trên các lớp hiếm.
+    (ví dụ 0.10) để tránh cộng chồng làm tăng False Positives trên các lớp hiếm.
     """
     if _is_zero_tau(tau) or class_priors is None:
         return logits
@@ -191,16 +190,11 @@ def optimize_classwise_posthoc_tau(
     l2_reg=0.06,
 ):
     """
-    Tối ưu hoá ngưỡng hiệu chỉnh hậu nghiệm CHỐNG OVERFIT TRÊN TẬP VALIDATION NHỎ
-    VÀ BẢO VỆ CẢ PRECISION LẪN RECALL (F1) CHO CẢ 3 LỚP HIẾM (Disgust=5, Fear=6, Contempt=7):
-    - Khắc phục lỗi ở phiên bản cũ: Phiên bản cũ cho phép tau_c chạy rộng từ [0.20, 0.70] trên tập Val
-      chỉ có 28 mẫu Disgust và 30 mẫu Contempt, dẫn tới việc đẩy tau_0 (Neutral) lên 0.70 và gây ra
-      80-110 dự đoán nhầm (False Positives) sang Contempt/Disgust trên tập Test!
-    - Giải pháp mới:
-      1. Bước 1: Quét tìm hệ số vô hướng `best_scalar` chung cho cả 8 lớp trong miền [0.0, 0.30]
-         (vì mô hình đã học sẵn `stage1_tau=0.30` trong lúc train).
-      2. Bước 2: Chỉ cho phép từng lớp `tau_c` tinh chỉnh trong biên độ rất hẹp `[best_scalar - 0.08, best_scalar + 0.08]`
-         với hệ số phạt L2 mạnh (`l2_reg=0.06`) và tối ưu trực tiếp F1-score của cả 3 lớp hiếm `(5, 6, 7)`.
+    Tối ưu hoá ngưỡng hiệu chỉnh hậu nghiệm hạn chế overfit trên tập Validation nhỏ
+    và cân bằng cả Precision lẫn Recall (F1) cho 3 lớp hiếm (Disgust=5, Fear=6, Contempt=7):
+      1. Bước 1: Quét tìm hệ số vô hướng `best_scalar` chung cho cả 8 lớp trong miền [0.0, 0.30].
+      2. Bước 2: Chỉ cho phép từng lớp `tau_c` tinh chỉnh trong biên độ hẹp `[best_scalar - 0.08, best_scalar + 0.08]`
+         với hệ số phạt L2 (`l2_reg=0.06`) và tối ưu kết hợp F1-score của cả 3 lớp hiếm `(5, 6, 7)`.
     """
     if isinstance(val_logits, torch.Tensor):
         logits_np = val_logits.detach().cpu().numpy()
@@ -224,11 +218,9 @@ def optimize_classwise_posthoc_tau(
         rare_f1_mean = float(np.mean([per_class_f1[c] for c in rare_classes]))
         l2_pen = float(np.mean((tau_vec - ref_tau) ** 2))
 
-        # Hàm mục tiêu kết hợp Val Composite + thưởng F1 của 3 lớp hiếm (Disgust, Fear, Contempt) - phạt L2 mạnh
         obj = comp + 0.12 * rare_f1_mean - float(l2_reg) * l2_pen
         return obj, acc, macro_f1, comp, per_class_rec, per_class_f1
 
-    # Bước 1: Tìm hằng số vô hướng scalar_tau tốt nhất trên miền [0.0, 0.30]
     best_scalar = float(base_tau)
     best_scalar_obj = -1e9
     for cand_s in np.linspace(0.0, 0.30, 31, dtype=np.float32):
@@ -243,7 +235,6 @@ def optimize_classwise_posthoc_tau(
     best_obj, base_acc, base_f1, base_comp, base_rec, base_pf1 = eval_tau_vec(best_tau, best_scalar)
     min_allowed_acc = base_acc - float(max_acc_drop)
 
-    # Bước 2: Tinh chỉnh nhẹ từng lớp trong khoảng hẹp ±0.08 quanh best_scalar để chống Overfit
     search_order = list(rare_classes) + [c for c in range(num_classes) if c not in rare_classes]
     low_bound = max(0.0, best_scalar - 0.08)
     high_bound = min(0.35, best_scalar + 0.08)
@@ -270,14 +261,20 @@ def optimize_classwise_posthoc_tau(
             break
 
     _, final_acc, final_f1, final_comp, final_rec, final_pf1 = eval_tau_vec(best_tau, best_scalar)
-    print("\n=== TỐI ƯU HIỆU CHỈNH LOGIT HẬU NGHIỆM CHỐNG OVERFIT (3 LỚP HIẾM: DISGUST, FEAR, CONTEMPT) ===")
-    print(f"  • Scalar tau tối ưu ({best_scalar:.3f}) -> Val Comp: {base_comp*100:.2f}% | Val Macro-F1: {base_f1*100:.2f}% | "
-          f"Val Acc: {base_acc*100:.2f}%")
-    print(f"  • Vector tau tinh chỉnh -> Val Comp: {final_comp*100:.2f}% | Val Macro-F1: {final_f1*100:.2f}% | "
-          f"Val Acc: {final_acc*100:.2f}%")
-    print(f"  • F1 trên Val (3 lớp hiếm) -> Disgust: {final_pf1[5]*100:.2f}% (Rec {final_rec[5]*100:.1f}%) | "
-          f"Fear: {final_pf1[6]*100:.2f}% (Rec {final_rec[6]*100:.1f}%) | "
-          f"Contempt: {final_pf1[7]*100:.2f}% (Rec {final_rec[7]*100:.1f}%)")
+    print("\n=== TỐI ƯU HIỆU CHỈNH LOGIT HẬU NGHIỆM (3 LỚP HIẾM: DISGUST, FEAR, CONTEMPT) ===")
+    print(
+        f"  • Scalar tau tối ưu ({best_scalar:.3f}) -> Val Comp: {base_comp*100:.2f}% | "
+        f"Val Macro-F1: {base_f1*100:.2f}% | Val Acc: {base_acc*100:.2f}%"
+    )
+    print(
+        f"  • Vector tau tinh chỉnh -> Val Comp: {final_comp*100:.2f}% | "
+        f"Val Macro-F1: {final_f1*100:.2f}% | Val Acc: {final_acc*100:.2f}%"
+    )
+    print(
+        f"  • F1 trên Val (3 lớp hiếm) -> Disgust: {final_pf1[5]*100:.2f}% (Rec {final_rec[5]*100:.1f}%) | "
+        f"Fear: {final_pf1[6]*100:.2f}% (Rec {final_rec[6]*100:.1f}%) | "
+        f"Contempt: {final_pf1[7]*100:.2f}% (Rec {final_rec[7]*100:.1f}%)"
+    )
     print(f"  • Vector tau_c (8 lớp): {np.round(best_tau, 3).tolist()}")
     return best_tau
 
@@ -531,30 +528,104 @@ def generate_saliency_map(model, image_tensor, target_class=None):
     return generate_gradcam(model, image_tensor, target_class=target_class)
 
 
-def evaluate_private_test(y_true, y_pred, emotion_dict, title_prefix="Test"):
+def _compute_bootstrap_ci_95(y_true, y_pred, num_classes=8, n_boot=1000, seed=42):
+    """
+    Tính khoảng tin cậy 95% (95% Confidence Interval) bằng phương pháp Bootstrap (n_boot=1000, seed cố định)
+    cho Macro-F1 và Recall, F1 của 3 lớp hiếm (Disgust=5, Fear=6, Contempt=7) một cách vector hóa.
+    """
+    y_true_arr = np.asarray(y_true, dtype=np.int64)
+    y_pred_arr = np.asarray(y_pred, dtype=np.int64)
+    n_samples = len(y_true_arr)
+    rng = np.random.RandomState(seed)
+
+    flat_pairs = y_true_arr * num_classes + y_pred_arr
+    boot_macro_f1 = np.empty(n_boot, dtype=np.float64)
+    boot_rec = {5: np.empty(n_boot, dtype=np.float64), 6: np.empty(n_boot, dtype=np.float64), 7: np.empty(n_boot, dtype=np.float64)}
+    boot_f1 = {5: np.empty(n_boot, dtype=np.float64), 6: np.empty(n_boot, dtype=np.float64), 7: np.empty(n_boot, dtype=np.float64)}
+
+    for b in range(n_boot):
+        sample_idx = rng.randint(0, n_samples, size=n_samples)
+        cm = np.bincount(flat_pairs[sample_idx], minlength=num_classes * num_classes).reshape(num_classes, num_classes)
+        tp = np.diag(cm).astype(np.float64)
+        support = cm.sum(axis=1).astype(np.float64)
+        pred_pos = cm.sum(axis=0).astype(np.float64)
+
+        rec = np.divide(tp, support, out=np.zeros_like(tp), where=support > 0)
+        denom = support + pred_pos
+        f1 = np.divide(2.0 * tp, denom, out=np.zeros_like(tp), where=denom > 0)
+
+        boot_macro_f1[b] = np.mean(f1)
+        for c in (5, 6, 7):
+            boot_rec[c][b] = rec[c]
+            boot_f1[c][b] = f1[c]
+
+    def pct_ci(arr):
+        low, high = np.percentile(arr, [2.5, 97.5])
+        return (float(low), float(high))
+
+    return {
+        "macro_f1_ci95": pct_ci(boot_macro_f1),
+        "disgust_recall_ci95": pct_ci(boot_rec[5]),
+        "disgust_f1_ci95": pct_ci(boot_f1[5]),
+        "fear_recall_ci95": pct_ci(boot_rec[6]),
+        "fear_f1_ci95": pct_ci(boot_f1[6]),
+        "contempt_recall_ci95": pct_ci(boot_rec[7]),
+        "contempt_f1_ci95": pct_ci(boot_f1[7]),
+    }
+
+
+def evaluate_private_test(y_true, y_pred, emotion_dict, title_prefix="Test", n_boot=1000, bootstrap_seed=42):
     """
     Xuất báo cáo kiểm định lấy Macro F1 & Composite Score làm chỉ số chính,
-    kèm F1 & Recall của cả 3 lớp hiếm: Disgust, Fear và Contempt.
+    kèm F1 & Recall của cả 3 lớp hiếm (Disgust, Fear, Contempt), support theo lớp,
+    và khoảng tin cậy 95% (Bootstrap n_boot=1000, seed cố định).
     """
-    labels = [emotion_dict[i] for i in range(len(emotion_dict))]
-    acc, macro_f1, weighted_f1, composite = compute_epoch_metrics(y_true, y_pred)
-    per_class_recall = recall_score(y_true, y_pred, average=None, zero_division=0)
-    per_class_f1 = f1_score(y_true, y_pred, average=None, zero_division=0)
+    num_classes = len(emotion_dict)
+    labels = [emotion_dict[i] for i in range(num_classes)]
+    y_true_arr = np.asarray(y_true, dtype=np.int64)
+    y_pred_arr = np.asarray(y_pred, dtype=np.int64)
+
+    acc, macro_f1, weighted_f1, composite = compute_epoch_metrics(y_true_arr, y_pred_arr)
+    per_class_recall = recall_score(y_true_arr, y_pred_arr, average=None, labels=list(range(num_classes)), zero_division=0)
+    per_class_f1 = f1_score(y_true_arr, y_pred_arr, average=None, labels=list(range(num_classes)), zero_division=0)
+    support_counts = np.bincount(y_true_arr, minlength=num_classes)
+    class_support = {labels[i]: int(support_counts[i]) for i in range(num_classes)}
+
+    ci_stats = _compute_bootstrap_ci_95(
+        y_true_arr, y_pred_arr, num_classes=num_classes, n_boot=n_boot, seed=bootstrap_seed
+    )
+
+    mf1_lo, mf1_hi = ci_stats["macro_f1_ci95"]
+    d_f1_lo, d_f1_hi = ci_stats["disgust_f1_ci95"]
+    d_rc_lo, d_rc_hi = ci_stats["disgust_recall_ci95"]
+    f_f1_lo, f_f1_hi = ci_stats["fear_f1_ci95"]
+    f_rc_lo, f_rc_hi = ci_stats["fear_recall_ci95"]
+    c_f1_lo, c_f1_hi = ci_stats["contempt_f1_ci95"]
+    c_rc_lo, c_rc_hi = ci_stats["contempt_recall_ci95"]
 
     print(f"=== TỔNG HỢP CHỈ SỐ TRÊN TẬP {title_prefix.upper()} ===")
     print(
-        f"Macro F1: {macro_f1*100:.2f}% | Composite (0.5Acc+0.5F1): {composite*100:.2f}% | "
+        f"Macro F1: {macro_f1*100:.2f}% (95% CI: [{mf1_lo*100:.2f}%, {mf1_hi*100:.2f}%]) | "
+        f"Composite (0.5Acc+0.5F1): {composite*100:.2f}% | "
         f"Accuracy: {acc*100:.2f}% | Weighted F1: {weighted_f1*100:.2f}%"
     )
+    print(f"Chi tiết 3 lớp hiếm (kèm 95% Bootstrap CI, n_boot={n_boot}, seed={bootstrap_seed}):")
     print(
-        f"Chi tiết 3 lớp hiếm -> Disgust (F1: {per_class_f1[5]*100:.2f}%, Rec: {per_class_recall[5]*100:.2f}%) | "
-        f"Fear (F1: {per_class_f1[6]*100:.2f}%, Rec: {per_class_recall[6]*100:.2f}%) | "
-        f"Contempt (F1: {per_class_f1[7]*100:.2f}%, Rec: {per_class_recall[7]*100:.2f}%)\n"
+        f"  • Disgust  (n={support_counts[5]:>3}) -> F1: {per_class_f1[5]*100:.2f}% [{d_f1_lo*100:.2f}%, {d_f1_hi*100:.2f}%] | "
+        f"Rec: {per_class_recall[5]*100:.2f}% [{d_rc_lo*100:.2f}%, {d_rc_hi*100:.2f}%]"
+    )
+    print(
+        f"  • Fear     (n={support_counts[6]:>3}) -> F1: {per_class_f1[6]*100:.2f}% [{f_f1_lo*100:.2f}%, {f_f1_hi*100:.2f}%] | "
+        f"Rec: {per_class_recall[6]*100:.2f}% [{f_rc_lo*100:.2f}%, {f_rc_hi*100:.2f}%]"
+    )
+    print(
+        f"  • Contempt (n={support_counts[7]:>3}) -> F1: {per_class_f1[7]*100:.2f}% [{c_f1_lo*100:.2f}%, {c_f1_hi*100:.2f}%] | "
+        f"Rec: {per_class_recall[7]*100:.2f}% [{c_rc_lo*100:.2f}%, {c_rc_hi*100:.2f}%]\n"
     )
     print("=== BÁO CÁO KIỂM ĐỊNH CHI TIẾT (CLASSIFICATION REPORT) ===")
-    print(classification_report(y_true, y_pred, target_names=labels, digits=4, zero_division=0))
+    print(classification_report(y_true_arr, y_pred_arr, labels=list(range(num_classes)), target_names=labels, digits=4, zero_division=0))
 
-    cm = confusion_matrix(y_true, y_pred)
+    cm = confusion_matrix(y_true_arr, y_pred_arr, labels=list(range(num_classes)))
     plt.figure(figsize=(10, 8))
     sns.heatmap(cm, annot=True, fmt="d", cmap="Blues", xticklabels=labels, yticklabels=labels)
     plt.title(f"Ma Trận Nhầm Lẫn (Confusion Matrix) - {title_prefix}")
@@ -573,4 +644,7 @@ def evaluate_private_test(y_true, y_pred, emotion_dict, title_prefix="Test"):
         "disgust_f1": float(per_class_f1[5]),
         "fear_f1": float(per_class_f1[6]),
         "contempt_f1": float(per_class_f1[7]),
+        "class_support": class_support,
+        "bootstrap_ci95": ci_stats,
+        **ci_stats,
     }
