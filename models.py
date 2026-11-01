@@ -1,13 +1,60 @@
+import math
 import torch
 import torch.nn as nn
+
+
+class ECABlock(nn.Module):
+    """
+    Khối Efficient Channel Attention (Wang et al., CVPR 2020):
+    Sử dụng tích chập 1D cục bộ dọc theo chiều kênh mà KHÔNG giảm chiều (no dimensionality reduction),
+    giúp bảo toàn mối tương quan kênh tinh tế cho các vi biểu cảm với chi phí tham số gần như bằng 0.
+    """
+    def __init__(self, channels, gamma=2, b=1):
+        super().__init__()
+        t = int(abs((math.log2(channels) + b) / gamma))
+        k_size = t if t % 2 else t + 1
+        k_size = max(3, k_size)
+        self.avg_pool = nn.AdaptiveAvgPool2d(1)
+        self.conv = nn.Conv1d(1, 1, kernel_size=k_size, padding=(k_size - 1) // 2, bias=False)
+        self.sigmoid = nn.Sigmoid()
+
+    def forward(self, x):
+        y = self.avg_pool(x)  # (B, C, 1, 1)
+        y = y.squeeze(-1).transpose(-1, -2)  # (B, 1, C)
+        y = self.conv(y)  # (B, 1, C)
+        y = self.sigmoid(y).transpose(-1, -2).unsqueeze(-1)  # (B, C, 1, 1)
+        return x * y.expand_as(x)
+
+
+class SpatialMicroAttention(nn.Module):
+    """
+    Khối Chú ý Không gian Vi biểu cảm có Cổng Tắt (Residual Spatial Micro-Attention):
+    - Làm nổi bật toạ độ vùng mắt, chân mày nhíu (Fear/Anger), sống mũi nhăn (Disgust) và khoé miệng
+      nhếch lệch (Contempt) trên ảnh 48x48.
+    - Sử dụng cổng tắt `x * (0.5 + 0.5 * scale)` thay vì nhân trực tiếp `x * scale` để đảm bảo
+      tín hiệu nền không bao giờ bị suy giảm dưới 50% khi đi qua nhiều khối tích chập liên tiếp.
+    """
+    def __init__(self, kernel_size=3):
+        super().__init__()
+        padding = kernel_size // 2
+        self.conv = nn.Sequential(
+            nn.Conv2d(2, 1, kernel_size=kernel_size, padding=padding, bias=False),
+            nn.BatchNorm2d(1),
+            nn.Sigmoid(),
+        )
+
+    def forward(self, x):
+        avg_out = torch.mean(x, dim=1, keepdim=True)
+        max_out, _ = torch.max(x, dim=1, keepdim=True)
+        spatial_map = torch.cat([avg_out, max_out], dim=1)
+        scale = self.conv(spatial_map)
+        return x * (0.5 + 0.5 * scale)
 
 
 class SEBlock(nn.Module):
     """
     Khối Squeeze-and-Excitation (Hu et al., CVPR 2018):
-    Nén thông tin không gian toàn cục bằng Global Average Pooling và học trọng số
-    chọn lọc kênh (Channel Attention), giúp khuếch đại các kênh đặc trưng vùng mắt,
-    chân mày, khoé miệng và triệt tiêu các kênh nhiễu nền.
+    Học trọng số chọn lọc kênh toàn cục.
     """
     def __init__(self, channels, reduction=16):
         super().__init__()
@@ -28,14 +75,13 @@ class SEBlock(nn.Module):
 
 class ResSEBlock(nn.Module):
     """
-    Khối Tích chập kết hợp nhánh tắt Residual (He et al., CVPR 2016) và SE-Attention:
-    - Dùng `bias=False` trước `BatchNorm2d` để loại bỏ tham số dư thừa.
-    - Nhánh tắt `shortcut` (1x1 Conv) giúp gradient truyền thẳng, chống suy giảm đạo hàm
-      và kết hợp đặc trưng biên mức thấp với ngữ nghĩa mức cao.
-    - Không đặt `Dropout2d` xen giữa các khối `BatchNorm2d` để tránh hiện tượng lệch phương sai
-      (Variance Shift - Li et al., CVPR 2019) giữa lúc Train và Eval.
+    Khối Tích chập Tự xây dựng (Custom Residual Attention Block) đã khắc phục lỗi Suy giảm Tín hiệu:
+    - Ở phiên bản cũ, `out` bị nhân nối tiếp qua 3 cổng Sigmoid (`se` -> `eca` -> `spatial_attn`),
+      làm biên độ đặc trưng vi biểu cảm bị bóp nghẹt về gần 0.
+    - Ở phiên bản mới: Kết hợp SONG SONG `ECA` (85%) và `SE` (15%) trong 1 bước duy nhất (vẫn giữ nguyên
+      tương thích `state_dict` 100%), sau đó đi qua `SpatialMicroAttention` có cổng tắt `0.5 + 0.5 * scale`.
     """
-    def __init__(self, in_channels, out_channels, pool=True):
+    def __init__(self, in_channels, out_channels, pool=True, use_eca=True, use_spatial_attn=True):
         super().__init__()
         self.conv1 = nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1, bias=False)
         self.bn1 = nn.BatchNorm2d(out_channels)
@@ -43,7 +89,10 @@ class ResSEBlock(nn.Module):
 
         self.conv2 = nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1, bias=False)
         self.bn2 = nn.BatchNorm2d(out_channels)
+
         self.se = SEBlock(out_channels, reduction=16)
+        self.eca = ECABlock(out_channels) if use_eca else None
+        self.spatial_attn = SpatialMicroAttention(kernel_size=3) if use_spatial_attn else None
 
         if in_channels != out_channels:
             self.shortcut = nn.Sequential(
@@ -65,7 +114,15 @@ class ResSEBlock(nn.Module):
 
         out = self.conv2(out)
         out = self.bn2(out)
-        out = self.se(out)
+
+        # Kết hợp song song thay vì nhân chồng nối tiếp 2 tầng Channel Attention
+        if self.eca is not None:
+            out = 0.85 * self.eca(out) + 0.15 * self.se(out)
+        else:
+            out = self.se(out)
+
+        if self.spatial_attn is not None:
+            out = self.spatial_attn(out)
 
         out = self.act2(out + residual)
         out = self.pool(out)
@@ -74,22 +131,23 @@ class ResSEBlock(nn.Module):
 
 class CustomCNN(nn.Module):
     """
-    Phương án C hoàn chỉnh — Kiến trúc CustomResSECNN (giữ tên class CustomCNN để tương thích toàn bộ dự án):
-    - Block 1: (1, 48, 48)   -> (64, 24, 24)  [ResSEBlock + MaxPool2d]
-    - Block 2: (64, 24, 24)  -> (128, 12, 12) [ResSEBlock + MaxPool2d]
-    - Block 3: (128, 12, 12) -> (256, 6, 6)   [ResSEBlock + MaxPool2d]
-    - Block 4: (256, 6, 6)   -> (512, 6, 6)   [ResSEBlock không MaxPool -> bảo toàn bản đồ đặc trưng 6x6]
-    - Multi-Scale Pooling Head: Ghép nối Global Average Pooling (512) + Global Max Pooling (512) -> 1024 chiều
-      rồi qua tầng phân loại tinh gọn (chỉ ~5.1M tham số thay vì ~7.05M như mạng cũ, chống overfit mạnh mẽ).
+    Kiến trúc CustomCNN tự thiết kế chuyên biệt cho ảnh mặt 48x48 (FER2013 / FER+):
+    - Block 1: (1, 48, 48)   -> (64, 24, 24)
+    - Block 2: (64, 24, 24)  -> (128, 12, 12)
+    - Block 3: (128, 12, 12) -> (256, 6, 6)
+    - Block 4: (256, 6, 6)   -> (512, 6, 6) [Không MaxPool -> bảo toàn bản đồ đặc trưng 6x6]
+    - Multi-Scale Pooling Head: Ghép nối Global Average Pooling (512) + Global Max Pooling (512) -> 1024 chiều.
+    - Giảm Dropout ở tầng phân loại từ 0.4 xuống 0.3 để tránh làm mất đặc trưng của các lớp hiếm.
+    - Hỗ trợ `freeze_backbone(freeze=True, unfreeze_block4=True)` để ở Giai đoạn 2 có thể tinh chỉnh
+      đồng thời cả `block4` (bản đồ đặc trưng 6x6) lẫn `classifier` trên ảnh gốc sạch.
     """
-    def __init__(self, num_classes=8):
+    def __init__(self, num_classes=8, use_eca=True, use_spatial_attn=True, dropout_p=0.3):
         super(CustomCNN, self).__init__()
 
-        self.block1 = ResSEBlock(1, 64, pool=True)
-        self.block2 = ResSEBlock(64, 128, pool=True)
-        self.block3 = ResSEBlock(128, 256, pool=True)
-        # Giữ độ phân giải không gian 6x6 ở Block 4 để không làm mất chi tiết khoé miệng / chân mày
-        self.block4 = ResSEBlock(256, 512, pool=False)
+        self.block1 = ResSEBlock(1, 64, pool=True, use_eca=use_eca, use_spatial_attn=use_spatial_attn)
+        self.block2 = ResSEBlock(64, 128, pool=True, use_eca=use_eca, use_spatial_attn=use_spatial_attn)
+        self.block3 = ResSEBlock(128, 256, pool=True, use_eca=use_eca, use_spatial_attn=use_spatial_attn)
+        self.block4 = ResSEBlock(256, 512, pool=False, use_eca=use_eca, use_spatial_attn=use_spatial_attn)
 
         self.avg_pool = nn.AdaptiveAvgPool2d((1, 1))
         self.max_pool = nn.AdaptiveMaxPool2d((1, 1))
@@ -99,15 +157,17 @@ class CustomCNN(nn.Module):
             nn.Linear(512 * 2, 256, bias=False),
             nn.BatchNorm1d(256),
             nn.LeakyReLU(negative_slope=0.1, inplace=True),
-            nn.Dropout(p=0.4),
+            nn.Dropout(p=dropout_p),
             nn.Linear(256, num_classes),
         )
 
+        self.backbone_frozen = False
+        self.unfreeze_block4 = False
         self._init_weights()
 
     def _init_weights(self):
         for m in self.modules():
-            if isinstance(m, nn.Conv2d):
+            if isinstance(m, (nn.Conv2d, nn.Conv1d)):
                 nn.init.kaiming_normal_(m.weight, a=0.1, mode="fan_out", nonlinearity="leaky_relu")
             elif isinstance(m, (nn.BatchNorm2d, nn.BatchNorm1d)):
                 nn.init.constant_(m.weight, 1.0)
@@ -117,13 +177,46 @@ class CustomCNN(nn.Module):
                 if m.bias is not None:
                     nn.init.constant_(m.bias, 0.0)
 
+    def freeze_backbone(self, freeze=True, unfreeze_block4=True):
+        """
+        Đóng băng các khối tích chập đầu (block1..block3) và tuỳ chọn mở khoá block4 + classifier
+        ở Giai đoạn 2 để bản đồ đặc trưng 6x6 thích nghi tinh tế hơn với các lớp hiếm (Disgust, Fear, Contempt).
+        """
+        self.backbone_frozen = bool(freeze)
+        self.unfreeze_block4 = bool(unfreeze_block4)
+
+        frozen_blocks = (
+            (self.block1, self.block2, self.block3)
+            if (self.backbone_frozen and self.unfreeze_block4)
+            else (self.block1, self.block2, self.block3, self.block4)
+        )
+
+        for block in (self.block1, self.block2, self.block3, self.block4):
+            is_block_frozen = self.backbone_frozen and (block in frozen_blocks)
+            for param in block.parameters():
+                param.requires_grad = not is_block_frozen
+            if is_block_frozen:
+                block.eval()
+
+        for param in self.classifier.parameters():
+            param.requires_grad = True
+
+    def train(self, mode=True):
+        super().train(mode)
+        if mode and getattr(self, "backbone_frozen", False):
+            self.block1.eval()
+            self.block2.eval()
+            self.block3.eval()
+            if not getattr(self, "unfreeze_block4", False):
+                self.block4.eval()
+        return self
+
     def forward(self, x):
         x = self.block1(x)
         x = self.block2(x)
         x = self.block3(x)
         x = self.block4(x)
 
-        # Kết hợp đặc trưng trung bình toàn cục (ngữ cảnh khuôn mặt) và cực đại toàn cục (cơ mặt nổi bật nhất)
         x_avg = self.avg_pool(x)
         x_max = self.max_pool(x)
         x_cat = torch.cat([x_avg, x_max], dim=1)

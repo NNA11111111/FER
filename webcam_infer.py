@@ -1,3 +1,4 @@
+from pathlib import Path
 import time
 from collections import deque
 import cv2
@@ -6,6 +7,7 @@ import torch
 import torch.nn.functional as F
 
 from models import CustomCNN
+from eval_utils import apply_posthoc_logit_adjustment
 
 EMOTION_DICT = {
     0: "Neutral",
@@ -17,6 +19,14 @@ EMOTION_DICT = {
     6: "Fear",
     7: "Contempt",
 }
+
+# Phân phối tiên nghiệm chuẩn (Clean Stratified Class Priors pi_c) từ tập FER+ 70/15/15
+DEFAULT_CLASS_PRIORS = np.array(
+    [0.3600, 0.2815, 0.1093, 0.1257, 0.0888, 0.0059, 0.0226, 0.0063],
+    dtype=np.float32,
+)
+# Mặc định chỉ bù nhẹ 0.10 ở bước hậu nghiệm vì mô hình đã tích hợp stage1_tau=0.30 khi huấn luyện
+DEFAULT_POSTHOC_TAU = 0.10
 
 
 def preprocess_live_frame(face_crop):
@@ -44,17 +54,16 @@ def preprocess_live_frame(face_crop):
 class MultiFaceTracker:
     """
     Quản lý hàng đợi xác suất (deque) riêng biệt cho từng khuôn mặt dựa trên khoảng cách tâm (Centroid)
-    hoặc chỉ số IoU giữa các frame liên tiếp, giúp dự đoán ổn định khi có nhiều người trong khung hình.
+    giữa các frame liên tiếp, giúp dự đoán ổn định khi có nhiều người trong khung hình.
     """
     def __init__(self, maxlen=5, max_distance=80.0, max_missed_frames=10):
         self.maxlen = maxlen
         self.max_distance = max_distance
         self.max_missed_frames = max_missed_frames
-        self.tracks = {}  # track_id -> {"centroid": (cx, cy), "bbox": (x,y,w,h), "queue": deque, "missed": int}
+        self.tracks = {}
         self.next_id = 1
 
     def update(self, bboxes, probs_list):
-        # Tăng số frame bị mất dấu của tất cả các track hiện có
         for tid in list(self.tracks.keys()):
             self.tracks[tid]["missed"] += 1
 
@@ -95,7 +104,6 @@ class MultiFaceTracker:
             used_tracks.add(best_tid)
             assigned_track_ids.append(best_tid)
 
-        # Xoá các track đã rời khỏi khung hình quá max_missed_frames
         for tid in list(self.tracks.keys()):
             if self.tracks[tid]["missed"] > self.max_missed_frames:
                 del self.tracks[tid]
@@ -109,13 +117,46 @@ class MultiFaceTracker:
         return pred_idx, confidence
 
 
-def run_realtime_inference(model_path="best.pth"):
+def load_compatible_custom_cnn(model_path, device):
+    """
+    Tự động nạp trọng số cho CustomCNN: tương thích hoàn toàn với cả checkpoint mới
+    (có ECA + SpatialMicroAttention) lẫn checkpoint best.pth phiên bản cũ (chỉ có ResSEBlock).
+    """
+    ckpt_data = torch.load(model_path, map_location=device, weights_only=True)
+    state_dict = ckpt_data["model_state_dict"] if (isinstance(ckpt_data, dict) and "model_state_dict" in ckpt_data) else ckpt_data
+
+    has_eca = any(".eca." in k for k in state_dict.keys())
+    has_spatial = any(".spatial_attn." in k for k in state_dict.keys())
+
+    model = CustomCNN(num_classes=8, use_eca=has_eca, use_spatial_attn=has_spatial)
+    model.load_state_dict(state_dict, strict=True)
+    return model, ckpt_data
+
+
+def run_realtime_inference(
+    model_path="best.pth",
+    calibration_path="best_calibration.pt",
+    class_priors=DEFAULT_CLASS_PRIORS,
+    posthoc_tau=DEFAULT_POSTHOC_TAU,
+):
+    """
+    Chạy suy luận thời gian thực qua Webcam đồng bộ 100% với quy trình đánh giá (Evaluation).
+    """
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Đang sử dụng thiết bị: {device}")
 
-    model = CustomCNN(num_classes=8)
     try:
-        model.load_state_dict(torch.load(model_path, map_location=device, weights_only=True))
+        model, ckpt_data = load_compatible_custom_cnn(model_path, device)
+        if isinstance(ckpt_data, dict) and "model_state_dict" in ckpt_data:
+            class_priors = ckpt_data.get("class_priors", class_priors)
+            posthoc_tau = ckpt_data.get("posthoc_tau", posthoc_tau)
+
+        if Path(calibration_path).exists():
+            calib_data = torch.load(calibration_path, map_location="cpu", weights_only=False)
+            class_priors = calib_data.get("class_priors", class_priors)
+            posthoc_tau = calib_data.get("posthoc_tau", posthoc_tau)
+            print(f"Đã nạp cấu hình hiệu chỉnh Logit từ '{calibration_path}'.")
+
         model.to(device)
         model.eval()
         print("Tải trọng số thành công. Đang mở Webcam...")
@@ -157,7 +198,10 @@ def run_realtime_inference(model_path="best.pth"):
             batch_input = torch.cat(batch_tensors, dim=0).to(device)
             with torch.no_grad():
                 outputs = model(batch_input)
-                batch_probs = F.softmax(outputs, dim=1).cpu().numpy()
+                adj_outputs = apply_posthoc_logit_adjustment(
+                    outputs, class_priors=class_priors, tau=posthoc_tau
+                )
+                batch_probs = F.softmax(adj_outputs, dim=1).cpu().numpy()
                 probs_list = [batch_probs[i] for i in range(len(bboxes))]
 
         track_ids = tracker.update(bboxes, probs_list)
@@ -177,7 +221,6 @@ def run_realtime_inference(model_path="best.pth"):
                 2,
             )
 
-        # Tính toán và hiển thị FPS theo thời gian thực (Exponential Moving Average)
         curr_time = time.perf_counter()
         instant_fps = 1.0 / max(curr_time - prev_time, 1e-6)
         prev_time = curr_time
@@ -193,7 +236,7 @@ def run_realtime_inference(model_path="best.pth"):
             2,
         )
 
-        cv2.imshow("Real-time FER+ (Multi-Face Tracking)", frame)
+        cv2.imshow("Real-time FER+ (CustomCNN + ECA/Spatial + Logit Adjustment)", frame)
 
         if cv2.waitKey(1) & 0xFF == ord("q"):
             break
