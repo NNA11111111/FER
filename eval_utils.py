@@ -58,7 +58,7 @@ def eac_attention_consistency_loss(attention_original, attention_flipped):
     """Align flipped-view attention to original coordinates and penalize disagreement."""
     if attention_original.shape != attention_flipped.shape:
         raise ValueError("Attention maps for the two views must have the same shape.")
-    return F.smooth_l1_loss(attention_original, torch.flip(attention_flipped, dims=(-1,)))
+    return F.mse_loss(attention_original, torch.flip(attention_flipped, dims=(-1,)))
 
 
 def compute_smooth_class_weights(class_counts, power=0.25, max_ratio=3.0):

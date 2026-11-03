@@ -5,7 +5,7 @@
 - The default stratified split is 60/30/10 using the majority hard label. `split_mode="original_usage"` preserves Training/PublicTest/PrivateTest roles after global deduplication.
 - A tied-label evaluation array can be returned separately from the official PrivateTest partition. It is intended for probability metrics against FER+ soft vote distributions.
 - Preprocessing defaults to 112×112. FER2013 pixels are still 48×48; interpolation changes model input dimensions but cannot restore missing detail.
-- EAC-style attention consistency is exposed as a loss helper and requires notebook training code to run original and flipped views.
+- Target-class CAM extraction, flipped-CAM consistency, and an EAC augmentation mode (horizontal flip plus dynamic erasing for every class) are exposed. Notebook training code still needs to compute only the original-view classification loss and add the consistency term.
 - ECE and scalar temperature fitting helpers are implemented. Temperature must be fitted on validation or out-of-fold logits, never the final test set.
 - A face-pretrained ResNet18 adapter is available but requires a local compatible checkpoint. No weights or measured accuracy claims are included.
 

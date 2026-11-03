@@ -215,22 +215,28 @@ class CustomCNN(nn.Module):
                 self.block4.eval()
         return self
 
-    def forward(self, x, return_attention=False):
-        attention_maps = []
+    def forward(self, x, return_attention=False, attention_classes=None):
         for block in (self.block1, self.block2, self.block3, self.block4):
-            if return_attention:
-                x, attention = block(x, return_attention=True)
-                if attention is not None:
-                    attention_maps.append(attention)
-            else:
-                x = block(x)
+            x = block(x)
 
         x_avg = self.avg_pool(x)
         x_max = self.max_pool(x)
         x_cat = torch.cat([x_avg, x_max], dim=1)
 
         logits = self.classifier(x_cat)
-        return (logits, attention_maps) if return_attention else logits
+        if not return_attention:
+            return logits
+        if not torch.is_grad_enabled():
+            raise RuntimeError("Attention CAM requires gradients; do not call with torch.no_grad().")
+        classes = (logits.argmax(dim=1) if attention_classes is None
+                   else torch.as_tensor(attention_classes, device=logits.device).long())
+        scores = logits.gather(1, classes.view(-1, 1)).sum()
+        gradients = torch.autograd.grad(
+            scores, x, retain_graph=True, create_graph=self.training
+        )[0]
+        cam = torch.relu((gradients * x).sum(dim=1, keepdim=True))
+        cam = cam / cam.amax(dim=(-2, -1), keepdim=True).clamp_min(1e-6)
+        return logits, cam
 
 
 class FacePretrainedResNet18(nn.Module):
@@ -262,5 +268,27 @@ class FacePretrainedResNet18(nn.Module):
                 raise ValueError("Checkpoint does not look like a compatible ResNet18 face backbone.")
             self.backbone.load_state_dict(compatible, strict=False)
 
-    def forward(self, x):
-        return self.backbone(x)
+    def forward(self, x, return_attention=False, attention_classes=None):
+        net = self.backbone
+        x = net.conv1(x)
+        x = net.bn1(x)
+        x = net.relu(x)
+        x = net.maxpool(x)
+        x = net.layer1(x)
+        x = net.layer2(x)
+        x = net.layer3(x)
+        features = net.layer4(x)
+        logits = net.fc(torch.flatten(net.avgpool(features), 1))
+        if not return_attention:
+            return logits
+        if not torch.is_grad_enabled():
+            raise RuntimeError("Attention CAM requires gradients; do not call with torch.no_grad().")
+        classes = (logits.argmax(dim=1) if attention_classes is None
+                   else torch.as_tensor(attention_classes, device=logits.device).long())
+        scores = logits.gather(1, classes.view(-1, 1)).sum()
+        gradients = torch.autograd.grad(
+            scores, features, retain_graph=True, create_graph=self.training
+        )[0]
+        cam = torch.relu((gradients * features).sum(dim=1, keepdim=True))
+        cam = cam / cam.amax(dim=(-2, -1), keepdim=True).clamp_min(1e-6)
+        return logits, cam

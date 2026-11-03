@@ -41,7 +41,7 @@ Set `split_manifest_dir` to save split IDs and configuration. `load_split_from_m
 
 ## Noise robustness and calibration
 
-`CustomCNN(images, return_attention=True)` returns logits and spatial attention maps. `eac_attention_consistency_loss` aligns maps from original and horizontally flipped views; the notebook must include this term during training and compare it by ablation.
+`CustomCNN(images, return_attention=True, attention_classes=...)` returns logits and target-class CAMs from the final feature map. `eac_attention_consistency_loss` aligns a CAM with the horizontally flipped view. Set `FER2013Dataset(..., eac_mode=True)` to use horizontal flip plus dynamic random erasing on every class (including rare classes), without the extra affine transform. The notebook must compute classification loss on the original view only, add the CAM consistency loss, and compare EAC on/off by ablation. This uses FER+ soft-label loss in place of EAC's hard-label classification loss.
 
 `fit_temperature` fits a single positive temperature on held-out logits. `expected_calibration_error` supports hard-label ECE and crowd-agreement ECE when soft targets are provided. Fit calibration only on validation or out-of-fold predictions, then report test metrics without refitting.
 
