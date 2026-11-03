@@ -10,7 +10,7 @@ FER2013 image and FER+ crowd-label pipeline for eight facial-expression classes.
 - `eval_utils.py`: soft-label losses, EAC-style attention consistency, scalar logit adjustment, ECE, temperature fitting, and metrics.
 - `dataset.py`: training augmentation and soft-label mixup.
 - `webcam_infer.py`: webcam inference using shared preprocessing and saved calibration.
-- `train-fer.ipynb`: training workflow. It is intentionally left unchanged; see the notebook instructions supplied with this update.
+- `train-fer.ipynb`: training workflow. The notebook contains the executed training and evaluation workflow, including saved outputs and metrics.
 
 ## Install
 
@@ -53,4 +53,4 @@ Save a checkpoint bundle as `best_bundle.pth` and run `python webcam_infer.py`. 
 
 ## Git artifacts
 
-Checkpoint files had been committed previously. They have been removed from reachable commit history in this local repository. The history rewrite changed commit IDs; collaborators must re-clone or reset to the rewritten history before any future push. No force-push was performed.
+The calibrated inference bundle (`best_bundle.pth`) and calibration metadata are included for webcam inference. Per-seed and redundant standalone checkpoints are excluded by `.gitignore` to keep the repository compact.

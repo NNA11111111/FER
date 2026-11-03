@@ -1,6 +1,4 @@
 dataset/fer2013.csv
-*.pth
-*.pt
 all_splits.csv
 dedup_report.csv
 split_config.json
@@ -9,3 +7,6 @@ val_ids.csv
 test_ids.csv
 split_manifest/
 __pycache__/
+
+best_custom_cnn_seed*.pth
+best.pth

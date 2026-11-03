@@ -1,8 +1,6 @@
 import math
-from pathlib import Path
 import torch
 import torch.nn as nn
-from torchvision.models import resnet18
 
 
 class ECABlock(nn.Module):
@@ -45,13 +43,12 @@ class SpatialMicroAttention(nn.Module):
             nn.Sigmoid(),
         )
 
-    def forward(self, x, return_attention=False):
+    def forward(self, x):
         avg_out = torch.mean(x, dim=1, keepdim=True)
         max_out, _ = torch.max(x, dim=1, keepdim=True)
         spatial_map = torch.cat([avg_out, max_out], dim=1)
         scale = self.conv(spatial_map)
-        attended = x * (0.5 + 0.5 * scale)
-        return (attended, scale) if return_attention else attended
+        return x * (0.5 + 0.5 * scale)
 
 
 class SEBlock(nn.Module):
@@ -108,7 +105,7 @@ class ResSEBlock(nn.Module):
         self.act2 = nn.LeakyReLU(negative_slope=0.1, inplace=True)
         self.pool = nn.MaxPool2d(kernel_size=2, stride=2) if pool else nn.Identity()
 
-    def forward(self, x, return_attention=False):
+    def forward(self, x):
         residual = self.shortcut(x)
 
         out = self.conv1(x)
@@ -124,13 +121,12 @@ class ResSEBlock(nn.Module):
         else:
             out = self.se(out)
 
-        attention = None
         if self.spatial_attn is not None:
-            out, attention = self.spatial_attn(out, return_attention=True)
+            out = self.spatial_attn(out)
 
         out = self.act2(out + residual)
         out = self.pool(out)
-        return (out, attention) if return_attention else out
+        return out
 
 
 class CustomCNN(nn.Module):
@@ -215,80 +211,14 @@ class CustomCNN(nn.Module):
                 self.block4.eval()
         return self
 
-    def forward(self, x, return_attention=False, attention_classes=None):
-        for block in (self.block1, self.block2, self.block3, self.block4):
-            x = block(x)
+    def forward(self, x):
+        x = self.block1(x)
+        x = self.block2(x)
+        x = self.block3(x)
+        x = self.block4(x)
 
         x_avg = self.avg_pool(x)
         x_max = self.max_pool(x)
         x_cat = torch.cat([x_avg, x_max], dim=1)
 
-        logits = self.classifier(x_cat)
-        if not return_attention:
-            return logits
-        if not torch.is_grad_enabled():
-            raise RuntimeError("Attention CAM requires gradients; do not call with torch.no_grad().")
-        classes = (logits.argmax(dim=1) if attention_classes is None
-                   else torch.as_tensor(attention_classes, device=logits.device).long())
-        scores = logits.gather(1, classes.view(-1, 1)).sum()
-        gradients = torch.autograd.grad(
-            scores, x, retain_graph=True, create_graph=self.training
-        )[0]
-        cam = torch.relu((gradients * x).sum(dim=1, keepdim=True))
-        cam = cam / cam.amax(dim=(-2, -1), keepdim=True).clamp_min(1e-6)
-        return logits, cam
-
-
-class FacePretrainedResNet18(nn.Module):
-    """112x112 FER classifier initialized from a local face-pretrained ResNet18 checkpoint.
-
-    The checkpoint must contain a ResNet18-compatible ``state_dict``. RGB input weights
-    are averaged into a single grayscale channel. A checkpoint is required so this class
-    cannot silently fall back to random initialization.
-    """
-    def __init__(self, checkpoint_path=None, num_classes=8, load_pretrained=True):
-        super().__init__()
-        backbone = resnet18(weights=None)
-        backbone.conv1 = nn.Conv2d(1, 64, kernel_size=7, stride=2, padding=3, bias=False)
-        self.backbone = backbone
-        self.backbone.fc = nn.Linear(backbone.fc.in_features, num_classes)
-        if load_pretrained:
-            if not checkpoint_path or not Path(checkpoint_path).is_file():
-                raise FileNotFoundError("Provide a local face-pretrained ResNet18 checkpoint.")
-            checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
-            state = checkpoint.get("state_dict", checkpoint.get("model_state_dict", checkpoint))
-            state = {k.removeprefix("module."): v for k, v in state.items() if isinstance(v, torch.Tensor)}
-            conv = state.get("conv1.weight")
-            if conv is not None and conv.ndim == 4 and conv.shape[1] == 3:
-                state["conv1.weight"] = conv.mean(dim=1, keepdim=True)
-            target = self.backbone.state_dict()
-            compatible = {k: v for k, v in state.items()
-                          if k in target and target[k].shape == v.shape and not k.startswith("fc.")}
-            if len(compatible) < 50:
-                raise ValueError("Checkpoint does not look like a compatible ResNet18 face backbone.")
-            self.backbone.load_state_dict(compatible, strict=False)
-
-    def forward(self, x, return_attention=False, attention_classes=None):
-        net = self.backbone
-        x = net.conv1(x)
-        x = net.bn1(x)
-        x = net.relu(x)
-        x = net.maxpool(x)
-        x = net.layer1(x)
-        x = net.layer2(x)
-        x = net.layer3(x)
-        features = net.layer4(x)
-        logits = net.fc(torch.flatten(net.avgpool(features), 1))
-        if not return_attention:
-            return logits
-        if not torch.is_grad_enabled():
-            raise RuntimeError("Attention CAM requires gradients; do not call with torch.no_grad().")
-        classes = (logits.argmax(dim=1) if attention_classes is None
-                   else torch.as_tensor(attention_classes, device=logits.device).long())
-        scores = logits.gather(1, classes.view(-1, 1)).sum()
-        gradients = torch.autograd.grad(
-            scores, features, retain_graph=True, create_graph=self.training
-        )[0]
-        cam = torch.relu((gradients * features).sum(dim=1, keepdim=True))
-        cam = cam / cam.amax(dim=(-2, -1), keepdim=True).clamp_min(1e-6)
-        return logits, cam
+        return self.classifier(x_cat)

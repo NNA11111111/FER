@@ -23,14 +23,12 @@ class FER2013Dataset(Dataset):
         erasing_scale=(0.01, 0.04),
         sample_weights=None,
         rare_classes=(5, 6, 7),
-        eac_mode=False,
     ):
         self.X = X
         self.y = y
         self.is_train = is_train
         self.erasing_enabled = is_train
         self.rare_classes = set(rare_classes) if rare_classes is not None else set()
-        self.eac_mode = bool(eac_mode)
         self.sample_weights = (
             np.asarray(sample_weights, dtype=np.float32)
             if sample_weights is not None
@@ -38,18 +36,13 @@ class FER2013Dataset(Dataset):
         )
 
         if self.is_train:
-            self.spatial_transform = (
-                transforms.RandomHorizontalFlip(p=0.5)
-                if self.eac_mode
-                else transforms.Compose([
-                    transforms.RandomAffine(degrees=10, translate=(0.08, 0.08), scale=(0.92, 1.08)),
-                    transforms.RandomHorizontalFlip(p=0.5),
-                ])
-            )
+            self.spatial_transform = transforms.Compose([
+                transforms.RandomAffine(degrees=10, translate=(0.08, 0.08), scale=(0.92, 1.08)),
+                transforms.RandomHorizontalFlip(p=0.5),
+            ])
             self.erasing_transform = (
-                transforms.RandomErasing(p=1.0 if self.eac_mode else erasing_prob,
-                                         scale=erasing_scale, value="random")
-                if self.eac_mode or erasing_prob > 0.0
+                transforms.RandomErasing(p=erasing_prob, scale=erasing_scale, value="random")
+                if erasing_prob > 0.0
                 else None
             )
         else:
@@ -81,7 +74,7 @@ class FER2013Dataset(Dataset):
             if (
                 self.erasing_enabled
                 and self.erasing_transform is not None
-                and (self.eac_mode or primary_cls not in self.rare_classes)
+                and primary_cls not in self.rare_classes
             ):
                 img_tensor = self.erasing_transform(img_tensor)
 
