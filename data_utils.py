@@ -618,6 +618,7 @@ def load_fer2013_csv(
     src_idx_all = np.asarray(src_idx_all, dtype=np.int64)
     img_name_all = np.asarray(img_name_all)
 
+    num_classes = len(EMOTION_COLS)
     if split_mode == "original_usage":
         split_indices = {
             "train": np.flatnonzero(usage_all == "Training"),
