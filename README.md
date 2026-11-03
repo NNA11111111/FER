@@ -12,6 +12,8 @@ A Python project for facial expression recognition on FER2013 images with FER+ c
 - `preprocessing.py`: shared CLAHE and normalization for training and webcam inference.
 - `test_data_utils.py`: synthetic-data checks for loading, splitting, and preprocessing.
 - `train-fer.ipynb`: training and evaluation workflow for Kaggle, including multiple seeds and checkpoint export.
+- `split_config.json`, `all_splits.csv`, `train_ids.csv`, `val_ids.csv`, `test_ids.csv`, and `dedup_report.csv`: recorded split settings, IDs, and deduplication results for the current dataset snapshot.
+- `best.pth`, `best_bundle.pth`, `best_calibration.pt`, and the three `best_custom_cnn_seed*.pth` files: trained model and calibration snapshots for inference and comparison.
 
 ## Requirements
 
@@ -46,13 +48,13 @@ Save a trained `CustomCNN` state dict or checkpoint as `best.pth` in the working
 python webcam_infer.py
 ```
 
-The webcam script expects a camera accessible as device 0. A `best_calibration.pt` file is optional; when available, its class priors and post-hoc adjustment settings are used. Model weights, FER data, and calibration files are not included in this repository.
+The webcam script expects a camera accessible as device 0. A `best_calibration.pt` file is optional; when available, its class priors and post-hoc adjustment settings are used. The repository includes the current model and calibration snapshots listed above. The raw FER2013 image CSV and FER+ labels are not included; provide those locally to reproduce training.
 
 ## Training
 
 Open `train-fer.ipynb` in Kaggle with the FER2013 image CSV (`fer2013.csv`), FER+ label CSV (`fer2013new.csv`), and repository Python modules available as inputs. Run its cells in order. The notebook locates those files, prepares deterministic splits, trains and evaluates the model, and saves checkpoints. Adjust paths and runtime settings in the notebook for a local environment.
 
-Generated checkpoints (`*.pth`, `*.pt`) and split reports are kept out of Git. Keep your own copies of those outputs if you need to reproduce inference or inspect a particular training run.
+The committed checkpoints and split reports are snapshots from the current local run. Running the notebook may generate newer files; review and commit updated artifacts when you want to publish a new snapshot. Raw image data remains excluded from Git.
 
 ## Tests
 
