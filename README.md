@@ -11,7 +11,6 @@ A Python project for facial expression recognition on FER2013 images with FER+ c
 - `webcam_infer.py`: real-time inference with a webcam and a compatible model checkpoint.
 - `preprocessing.py`: shared CLAHE and normalization for training and webcam inference.
 - `test_data_utils.py`: synthetic-data checks for loading, splitting, and preprocessing.
-- `review.md`: code review notes for this revision.
 - `train-fer.ipynb`: training and evaluation workflow for Kaggle, including multiple seeds and checkpoint export.
 
 ## Requirements
@@ -20,7 +19,7 @@ Python 3.9+ and the packages `numpy`, `pandas`, `opencv-python`, `scikit-learn`,
 
 ## Data
 
-Place FER2013 images and FER+ labels in CSV format locally. The loader expects an image CSV with `pixels`, and a label CSV with `Usage`, the eight emotion vote columns (`neutral`, `happiness`, `surprise`, `sadness`, `anger`, `disgust`, `fear`, `contempt`), and optionally `unknown` and `NF`. If both files share `image_id` or `id`, they are joined by that field; otherwise row order and row counts must match.
+Place FER2013 images and FER+ labels in CSV format locally. The loader expects an image CSV with `pixels`, and a label CSV with `Usage`, the eight emotion vote columns (`neutral`, `happiness`, `surprise`, `sadness`, `anger`, `disgust`, `fear`, `contempt`), and optionally `unknown` and `NF`. If both files share `image_id` or `id`, they are joined by that field. For files aligned by row order, set `allow_positional_join=True`; row counts must match.
 
 The raw image CSV is excluded from Git by `.gitignore`. The loader defaults to a deterministic 70/15/15 stratified split, tie filtering, and perceptual-hash deduplication. Set `use_stratify=False` to use the original `Usage` partitions. `return_soft_labels=True` and `return_sample_weights=True` expose the corresponding training targets and weights.
 
