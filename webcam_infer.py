@@ -7,7 +7,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-from models import CustomCNN
+from models import CustomCNN, FacePretrainedResNet18
 from eval_utils import apply_posthoc_logit_adjustment
 from preprocessing import PREPROCESSING_CONFIG, preprocess_fer_gray
 
@@ -145,7 +145,10 @@ def load_compatible_custom_cnn(model_path, device):
         use_eca = any(".eca." in k for k in state_dict.keys())
         use_spatial = any(".spatial_attn." in k for k in state_dict.keys())
 
-    model = CustomCNN(num_classes=8, use_eca=use_eca, use_spatial_attn=use_spatial)
+    if isinstance(ckpt_data, dict) and ckpt_data.get("model_type") == "face_resnet18":
+        model = FacePretrainedResNet18(load_pretrained=False, num_classes=8)
+    else:
+        model = CustomCNN(num_classes=8, use_eca=use_eca, use_spatial_attn=use_spatial)
     model.load_state_dict(state_dict, strict=True)
     return model, ckpt_data
 
@@ -165,6 +168,7 @@ def run_realtime_inference(
     calibration_path="best_calibration.pt",
     class_priors=None,
     posthoc_tau=None,
+    temperature=1.0,
     crop_margin_shrink=0.0,
 ):
     """
@@ -190,6 +194,7 @@ def run_realtime_inference(
             if "class_priors" in ckpt_data and ("posthoc_tau_vec" in ckpt_data or "posthoc_tau" in ckpt_data):
                 class_priors = ckpt_data["class_priors"]
                 posthoc_tau = ckpt_data.get("posthoc_tau_vec", ckpt_data.get("posthoc_tau"))
+                temperature = float(ckpt_data.get("temperature", temperature))
                 loaded_calib = True
 
         if not loaded_calib and Path(calibration_path).exists():
@@ -198,6 +203,7 @@ def run_realtime_inference(
                 if "class_priors" in calib_data and ("posthoc_tau" in calib_data or "posthoc_tau_vec" in calib_data):
                     class_priors = calib_data["class_priors"]
                     posthoc_tau = calib_data.get("posthoc_tau_vec", calib_data.get("posthoc_tau"))
+                    temperature = float(calib_data.get("temperature", temperature))
                     loaded_calib = True
                     print(f"Đã nạp cấu hình hiệu chỉnh Logit từ '{calibration_path}' (weights_only=True).")
             except Exception as calib_err:
@@ -277,7 +283,7 @@ def run_realtime_inference(
                 adj_outputs = apply_posthoc_logit_adjustment(
                     outputs, class_priors=class_priors, tau=posthoc_tau
                 )
-                batch_probs = F.softmax(adj_outputs, dim=1).cpu().numpy()
+                batch_probs = F.softmax(adj_outputs / max(float(temperature), 1e-6), dim=1).cpu().numpy()
                 probs_list = [batch_probs[i] for i in range(len(bboxes))]
 
         track_ids = tracker.update(bboxes, probs_list)

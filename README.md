@@ -1,61 +1,56 @@
 # FER+ Facial Expression Recognition
 
-A Python project for facial expression recognition on FER2013 images with FER+ crowd labels. It contains data preparation, a PyTorch dataset with training augmentations, a custom CNN, evaluation utilities, and webcam inference.
+FER2013 image and FER+ crowd-label pipeline for eight facial-expression classes. The code supports soft targets, optional official FER partitions, global deduplication, a separate tied-label evaluation set, EAC-style attention consistency, calibration metrics, webcam inference, and 112×112 model inputs.
 
-## Repository contents
+## Modules
 
-- `data_utils.py`: loads the FER2013 and FER+ CSV files, filters labels, deduplicates images, creates train/validation/test splits, and optionally returns soft labels and sample weights.
-- `dataset.py`: PyTorch dataset, training augmentations, and selective mixup helper.
-- `models.py`: residual CNN with channel and spatial attention.
-- `eval_utils.py`: losses, class balancing, metrics, calibration, Grad-CAM, and evaluation helpers.
-- `webcam_infer.py`: real-time inference with a webcam and a compatible model checkpoint.
-- `preprocessing.py`: shared CLAHE and normalization for training and webcam inference.
-- `test_data_utils.py`: synthetic-data checks for loading, splitting, and preprocessing.
-- `train-fer.ipynb`: training and evaluation workflow for Kaggle, including multiple seeds and checkpoint export.
-- `split_config.json`, `all_splits.csv`, `train_ids.csv`, `val_ids.csv`, `test_ids.csv`, and `dedup_report.csv`: recorded split settings, IDs, and deduplication results for the current dataset snapshot.
-- `best.pth`, `best_bundle.pth`, `best_calibration.pt`, and the three `best_custom_cnn_seed*.pth` files: trained model and calibration snapshots for inference and comparison.
+- `data_utils.py`: CSV validation, filtering, global exact/perceptual deduplication, stratified or original-Usage splits, and manifests.
+- `preprocessing.py`: shared resize, CLAHE, and normalization. The current input is 112×112; FER2013 source pixels remain 48×48, so interpolation cannot restore image detail.
+- `models.py`: custom attention CNN and a ResNet18 adapter requiring a local face-pretrained checkpoint.
+- `eval_utils.py`: soft-label losses, EAC-style attention consistency, scalar logit adjustment, ECE, temperature fitting, and metrics.
+- `dataset.py`: training augmentation and soft-label mixup.
+- `webcam_infer.py`: webcam inference using shared preprocessing and saved calibration.
+- `train-fer.ipynb`: training workflow. It is intentionally left unchanged; see the notebook instructions supplied with this update.
 
-## Requirements
+## Install
 
-Python 3.9+ and the packages `numpy`, `pandas`, `opencv-python`, `scikit-learn`, `scipy`, `torch`, `torchvision`, `matplotlib`, and `seaborn` are needed. Install compatible PyTorch and torchvision builds for your CPU or CUDA environment, then install the remaining packages with pip.
+Use Python 3.11 or 3.12 and install pinned dependencies from `requirements.txt`. Install a matching CPU/CUDA PyTorch wheel where your runtime requires a different wheel index.
 
-## Data
+## Data and split modes
 
-Place FER2013 images and FER+ labels in CSV format locally. The loader expects an image CSV with `pixels`, and a label CSV with `Usage`, the eight emotion vote columns (`neutral`, `happiness`, `surprise`, `sadness`, `anger`, `disgust`, `fear`, `contempt`), and optionally `unknown` and `NF`. If both files share `image_id` or `id`, they are joined by that field. For files aligned by row order, set `allow_positional_join=True`; row counts must match.
+The loader expects FER2013 `pixels` plus FER+ `Usage`, eight emotion vote columns, and optional `unknown`/`NF`. It joins by common `id`/`image_id` when possible. Positional joins require `allow_positional_join=True` and matching Usage values.
 
-The raw image CSV is excluded from Git by `.gitignore`. The loader defaults to a deterministic 70/15/15 stratified split, tie filtering, and perceptual-hash deduplication. Use `split_mode="original_usage"` to retain FER2013's `Training`, `PublicTest`, and `PrivateTest` partitions after filtering and global deduplication. `return_soft_labels=True` and `return_sample_weights=True` expose the corresponding training targets and weights.
+The default is stratified 60/30/10 (train/validation/test) by the majority hard label. To keep official partitions, use `split_mode="original_usage"`: Training → train, PublicTest → validation, PrivateTest → test. Deduplication runs globally before splitting, preventing duplicate images from crossing partitions.
 
-Set `split_manifest_dir` to write split manifests and a deduplication report. Use `load_split_from_manifest` to reload a recorded split. The shared preprocessing resizes grayscale images to the configured input size, applies CLAHE, and scales values to [-1, 1]. Evaluation helpers also provide expected calibration error, temperature fitting, and attention consistency loss.
-
-Example:
+For a separate tied-label evaluation set, use `split_mode="original_usage", return_tie_eval=True`. The loader then returns a fourth value `(X_tie, y_tie_soft, y_tie_hard)` for eligible PrivateTest ties. These examples are excluded from the ordinary splits and deduplicated against retained images. Use the soft labels for probability metrics.
 
 ```python
 from data_utils import load_fer2013_csv
 
-(train, val, test) = load_fer2013_csv(
-    "dataset/fer2013.csv",
-    "dataset/fer2013new.csv",
+(train, val, test, tie_eval) = load_fer2013_csv(
+    "fer2013.csv", "fer2013new.csv",
     return_soft_labels=True,
     return_sample_weights=True,
+    split_mode="original_usage",
+    return_tie_eval=True,
+    allow_positional_join=True,
 )
 ```
 
-## Webcam inference
+Set `split_manifest_dir` to save split IDs and configuration. `load_split_from_manifest` reconstructs the ordinary three splits.
 
-Save a trained `CustomCNN` state dict or checkpoint as `best.pth` in the working directory, then run:
+## Noise robustness and calibration
 
-```bash
-python webcam_infer.py
-```
+`CustomCNN(images, return_attention=True)` returns logits and spatial attention maps. `eac_attention_consistency_loss` aligns maps from original and horizontally flipped views; the notebook must include this term during training and compare it by ablation.
 
-The webcam script expects a camera accessible as device 0. A `best_calibration.pt` file is optional; when available, its class priors and post-hoc adjustment settings are used. The repository includes the current model and calibration snapshots listed above. The raw FER2013 image CSV and FER+ labels are not included; provide those locally to reproduce training.
+`fit_temperature` fits a single positive temperature on held-out logits. `expected_calibration_error` supports hard-label ECE and crowd-agreement ECE when soft targets are provided. Fit calibration only on validation or out-of-fold predictions, then report test metrics without refitting.
 
-## Training
+`FacePretrainedResNet18(checkpoint_path=...)` adapts a local ResNet18-compatible face-pretrained checkpoint to grayscale input. No pretrained weights are included. The 112×112 image is an upsampled FER2013 face, not a higher-resolution source image.
 
-Open `train-fer.ipynb` in Kaggle with the FER2013 image CSV (`fer2013.csv`), FER+ label CSV (`fer2013new.csv`), and repository Python modules available as inputs. Run its cells in order. The notebook locates those files, prepares deterministic splits, trains and evaluates the model, and saves checkpoints. Adjust paths and runtime settings in the notebook for a local environment.
+## Webcam
 
-The committed checkpoints and split reports are snapshots from the current local run. Running the notebook may generate newer files; review and commit updated artifacts when you want to publish a new snapshot. Raw image data remains excluded from Git.
+Save a checkpoint bundle as `best_bundle.pth` and run `python webcam_infer.py`. A bundle can store one scalar `posthoc_tau`, `temperature`, and class priors. Generated checkpoints and split manifests are ignored by Git.
 
-## Tests
+## Git artifacts
 
-Install `pytest` and run `python -m pytest test_data_utils.py` to check the data pipeline with synthetic inputs.
+Checkpoint files had been committed previously. They have been removed from reachable commit history in this local repository. The history rewrite changed commit IDs; collaborators must re-clone or reset to the rewritten history before any future push. No force-push was performed.

@@ -240,25 +240,27 @@ class FacePretrainedResNet18(nn.Module):
     are averaged into a single grayscale channel. A checkpoint is required so this class
     cannot silently fall back to random initialization.
     """
-    def __init__(self, checkpoint_path, num_classes=8):
+    def __init__(self, checkpoint_path=None, num_classes=8, load_pretrained=True):
         super().__init__()
-        if not checkpoint_path or not Path(checkpoint_path).is_file():
-            raise FileNotFoundError("Provide a local face-pretrained ResNet18 checkpoint.")
         backbone = resnet18(weights=None)
-        checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
-        state = checkpoint.get("state_dict", checkpoint.get("model_state_dict", checkpoint))
-        state = {k.removeprefix("module."): v for k, v in state.items() if isinstance(v, torch.Tensor)}
-        conv = state.get("conv1.weight")
-        if conv is not None and conv.ndim == 4 and conv.shape[1] == 3:
-            state["conv1.weight"] = conv.mean(dim=1, keepdim=True)
         backbone.conv1 = nn.Conv2d(1, 64, kernel_size=7, stride=2, padding=3, bias=False)
-        compatible = {k: v for k, v in state.items()
-                      if k in backbone.state_dict() and backbone.state_dict()[k].shape == v.shape}
-        if len(compatible) < 50:
-            raise ValueError("Checkpoint does not look like a compatible ResNet18 face backbone.")
-        backbone.load_state_dict(compatible, strict=False)
         self.backbone = backbone
         self.backbone.fc = nn.Linear(backbone.fc.in_features, num_classes)
+        if load_pretrained:
+            if not checkpoint_path or not Path(checkpoint_path).is_file():
+                raise FileNotFoundError("Provide a local face-pretrained ResNet18 checkpoint.")
+            checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
+            state = checkpoint.get("state_dict", checkpoint.get("model_state_dict", checkpoint))
+            state = {k.removeprefix("module."): v for k, v in state.items() if isinstance(v, torch.Tensor)}
+            conv = state.get("conv1.weight")
+            if conv is not None and conv.ndim == 4 and conv.shape[1] == 3:
+                state["conv1.weight"] = conv.mean(dim=1, keepdim=True)
+            target = self.backbone.state_dict()
+            compatible = {k: v for k, v in state.items()
+                          if k in target and target[k].shape == v.shape and not k.startswith("fc.")}
+            if len(compatible) < 50:
+                raise ValueError("Checkpoint does not look like a compatible ResNet18 face backbone.")
+            self.backbone.load_state_dict(compatible, strict=False)
 
     def forward(self, x):
         return self.backbone(x)

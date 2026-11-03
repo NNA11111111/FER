@@ -2,7 +2,7 @@ import cv2
 import numpy as np
 
 PREPROCESSING_CONFIG = {
-    "target_size": [48, 48],
+    "target_size": [112, 112],
     "clahe_clip_limit": 2.0,
     "clahe_tile_grid_size": [4, 4],
     "norm_mean": 0.5,
@@ -12,7 +12,7 @@ PREPROCESSING_CONFIG = {
 
 def preprocess_fer_gray(
     gray_img: np.ndarray,
-    target_size: tuple = (48, 48),
+    target_size: tuple = (112, 112),
     clip_limit: float = 2.0,
     tile_grid_size: tuple = (4, 4),
 ) -> np.ndarray:

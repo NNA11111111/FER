@@ -495,7 +495,8 @@ def denormalize_image(img_tensor):
     return np.clip(img, 0.0, 1.0)
 
 
-def ten_crop_inference(model, image_tensor, pad_size=4, crop_size=48, class_priors=None, posthoc_tau=0.0):
+def ten_crop_inference(model, image_tensor, pad_size=4, crop_size=112, class_priors=None, posthoc_tau=0.0,
+                       temperature=1.0):
     """
     Kỹ thuật Ten-Crop Averaging chuẩn theo Pramerdorfer & Kampel (2016)
     kết hợp tùy chọn Hiệu chỉnh Logit Hậu nghiệm.
@@ -515,7 +516,7 @@ def ten_crop_inference(model, image_tensor, pad_size=4, crop_size=48, class_prio
         logits = model(crops)
         if class_priors is not None and not _is_zero_tau(posthoc_tau):
             logits = apply_posthoc_logit_adjustment(logits, class_priors, tau=posthoc_tau)
-        probs = F.softmax(logits, dim=1)
+        probs = F.softmax(logits / max(float(temperature), 1e-6), dim=1)
         avg_probs = probs.mean(dim=0)
         predicted_label = torch.argmax(avg_probs).item()
 
@@ -578,7 +579,7 @@ def generate_gradcam(model, image_tensor, target_class=None, target_layer=None):
         cam += w * fmaps[i]
 
     cam = F.relu(cam).cpu().numpy()
-    cam = cv2.resize(cam, (48, 48), interpolation=cv2.INTER_CUBIC)
+    cam = cv2.resize(cam, (int(image_tensor.shape[-1]), int(image_tensor.shape[-2])), interpolation=cv2.INTER_CUBIC)
     if cam.max() > cam.min():
         cam = (cam - cam.min()) / (cam.max() - cam.min())
     else:
