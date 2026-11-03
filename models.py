@@ -1,6 +1,8 @@
 import math
+from pathlib import Path
 import torch
 import torch.nn as nn
+from torchvision.models import resnet18
 
 
 class ECABlock(nn.Module):
@@ -43,12 +45,13 @@ class SpatialMicroAttention(nn.Module):
             nn.Sigmoid(),
         )
 
-    def forward(self, x):
+    def forward(self, x, return_attention=False):
         avg_out = torch.mean(x, dim=1, keepdim=True)
         max_out, _ = torch.max(x, dim=1, keepdim=True)
         spatial_map = torch.cat([avg_out, max_out], dim=1)
         scale = self.conv(spatial_map)
-        return x * (0.5 + 0.5 * scale)
+        attended = x * (0.5 + 0.5 * scale)
+        return (attended, scale) if return_attention else attended
 
 
 class SEBlock(nn.Module):
@@ -105,7 +108,7 @@ class ResSEBlock(nn.Module):
         self.act2 = nn.LeakyReLU(negative_slope=0.1, inplace=True)
         self.pool = nn.MaxPool2d(kernel_size=2, stride=2) if pool else nn.Identity()
 
-    def forward(self, x):
+    def forward(self, x, return_attention=False):
         residual = self.shortcut(x)
 
         out = self.conv1(x)
@@ -121,12 +124,13 @@ class ResSEBlock(nn.Module):
         else:
             out = self.se(out)
 
+        attention = None
         if self.spatial_attn is not None:
-            out = self.spatial_attn(out)
+            out, attention = self.spatial_attn(out, return_attention=True)
 
         out = self.act2(out + residual)
         out = self.pool(out)
-        return out
+        return (out, attention) if return_attention else out
 
 
 class CustomCNN(nn.Module):
@@ -211,14 +215,50 @@ class CustomCNN(nn.Module):
                 self.block4.eval()
         return self
 
-    def forward(self, x):
-        x = self.block1(x)
-        x = self.block2(x)
-        x = self.block3(x)
-        x = self.block4(x)
+    def forward(self, x, return_attention=False):
+        attention_maps = []
+        for block in (self.block1, self.block2, self.block3, self.block4):
+            if return_attention:
+                x, attention = block(x, return_attention=True)
+                if attention is not None:
+                    attention_maps.append(attention)
+            else:
+                x = block(x)
 
         x_avg = self.avg_pool(x)
         x_max = self.max_pool(x)
         x_cat = torch.cat([x_avg, x_max], dim=1)
 
-        return self.classifier(x_cat)
+        logits = self.classifier(x_cat)
+        return (logits, attention_maps) if return_attention else logits
+
+
+class FacePretrainedResNet18(nn.Module):
+    """112x112 FER classifier initialized from a local face-pretrained ResNet18 checkpoint.
+
+    The checkpoint must contain a ResNet18-compatible ``state_dict``. RGB input weights
+    are averaged into a single grayscale channel. A checkpoint is required so this class
+    cannot silently fall back to random initialization.
+    """
+    def __init__(self, checkpoint_path, num_classes=8):
+        super().__init__()
+        if not checkpoint_path or not Path(checkpoint_path).is_file():
+            raise FileNotFoundError("Provide a local face-pretrained ResNet18 checkpoint.")
+        backbone = resnet18(weights=None)
+        checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
+        state = checkpoint.get("state_dict", checkpoint.get("model_state_dict", checkpoint))
+        state = {k.removeprefix("module."): v for k, v in state.items() if isinstance(v, torch.Tensor)}
+        conv = state.get("conv1.weight")
+        if conv is not None and conv.ndim == 4 and conv.shape[1] == 3:
+            state["conv1.weight"] = conv.mean(dim=1, keepdim=True)
+        backbone.conv1 = nn.Conv2d(1, 64, kernel_size=7, stride=2, padding=3, bias=False)
+        compatible = {k: v for k, v in state.items()
+                      if k in backbone.state_dict() and backbone.state_dict()[k].shape == v.shape}
+        if len(compatible) < 50:
+            raise ValueError("Checkpoint does not look like a compatible ResNet18 face backbone.")
+        backbone.load_state_dict(compatible, strict=False)
+        self.backbone = backbone
+        self.backbone.fc = nn.Linear(backbone.fc.in_features, num_classes)
+
+    def forward(self, x):
+        return self.backbone(x)

@@ -16,6 +16,49 @@ from sklearn.metrics import (
     precision_score,
 )
 import numpy as np
+from scipy.optimize import minimize_scalar
+
+
+def expected_calibration_error(probabilities, targets, n_bins=15, soft_targets=None):
+    """Top-label ECE; with soft_targets, confidence is compared to crowd agreement."""
+    probs = np.asarray(probabilities, dtype=np.float64)
+    if probs.ndim != 2 or probs.shape[1] < 2:
+        raise ValueError("probabilities must have shape (N, classes).")
+    confidence = probs.max(axis=1)
+    prediction = probs.argmax(axis=1)
+    if soft_targets is None:
+        accuracy = (prediction == np.asarray(targets).reshape(-1)).astype(np.float64)
+    else:
+        soft = np.asarray(soft_targets, dtype=np.float64)
+        accuracy = soft[np.arange(len(prediction)), prediction]
+    edges = np.linspace(0.0, 1.0, int(n_bins) + 1)
+    ece = 0.0
+    for lo, hi in zip(edges[:-1], edges[1:]):
+        mask = (confidence >= lo) & ((confidence < hi) if hi < 1.0 else (confidence <= hi))
+        if np.any(mask):
+            ece += mask.mean() * abs(confidence[mask].mean() - accuracy[mask].mean())
+    return float(ece)
+
+
+def fit_temperature(logits, targets, soft_targets=None):
+    """Fit one positive temperature on held-out logits by minimizing hard or soft NLL."""
+    z = torch.as_tensor(logits, dtype=torch.float64).detach().cpu()
+    if soft_targets is None:
+        y = torch.as_tensor(targets, dtype=torch.long).reshape(-1)
+        objective = lambda t: float(F.cross_entropy(z / t, y).item())
+    else:
+        q = torch.as_tensor(soft_targets, dtype=torch.float64)
+        objective = lambda t: float((-(q * F.log_softmax(z / t, dim=1)).sum(dim=1)).mean().item())
+    result = minimize_scalar(lambda log_t: objective(float(np.exp(log_t))),
+                             bounds=(-3.0, 3.0), method="bounded")
+    return float(np.exp(result.x))
+
+
+def eac_attention_consistency_loss(attention_original, attention_flipped):
+    """Align flipped-view attention to original coordinates and penalize disagreement."""
+    if attention_original.shape != attention_flipped.shape:
+        raise ValueError("Attention maps for the two views must have the same shape.")
+    return F.smooth_l1_loss(attention_original, torch.flip(attention_flipped, dims=(-1,)))
 
 
 def compute_smooth_class_weights(class_counts, power=0.25, max_ratio=3.0):
@@ -175,6 +218,26 @@ def apply_posthoc_logit_adjustment(logits, class_priors, tau=0.10):
     if tau_tensor.ndim == 0:
         return logits - tau_tensor * log_priors.unsqueeze(0)
     return logits - (tau_tensor * log_priors).unsqueeze(0)
+
+
+def optimize_scalar_posthoc_tau(val_logits, val_targets, class_priors,
+                                alpha_composite=0.5, max_acc_drop=0.005):
+    """Select one shared logit-adjustment tau on validation; avoids per-class tuning."""
+    logits = torch.as_tensor(val_logits).detach().cpu()
+    targets = np.asarray(val_targets, dtype=np.int64)
+    best = (float("-inf"), 0.0)
+    baseline_acc = accuracy_score(targets, logits.argmax(dim=1).numpy())
+    for tau in np.linspace(0.0, 0.30, 31):
+        adjusted = apply_posthoc_logit_adjustment(logits, class_priors, tau=float(tau))
+        pred = adjusted.argmax(dim=1).numpy()
+        acc = accuracy_score(targets, pred)
+        if acc < baseline_acc - max_acc_drop:
+            continue
+        macro_f1 = f1_score(targets, pred, average="macro", zero_division=0)
+        score = alpha_composite * acc + (1.0 - alpha_composite) * macro_f1
+        if score > best[0]:
+            best = (score, float(tau))
+    return best[1]
 
 
 def optimize_classwise_posthoc_tau(

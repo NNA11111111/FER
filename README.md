@@ -17,15 +17,15 @@ A Python project for facial expression recognition on FER2013 images with FER+ c
 
 ## Requirements
 
-Python 3.9+ and the packages `numpy`, `pandas`, `opencv-python`, `scikit-learn`, `torch`, `torchvision`, `matplotlib`, and `seaborn` are needed. Install compatible PyTorch and torchvision builds for your CPU or CUDA environment, then install the remaining packages with pip.
+Python 3.9+ and the packages `numpy`, `pandas`, `opencv-python`, `scikit-learn`, `scipy`, `torch`, `torchvision`, `matplotlib`, and `seaborn` are needed. Install compatible PyTorch and torchvision builds for your CPU or CUDA environment, then install the remaining packages with pip.
 
 ## Data
 
 Place FER2013 images and FER+ labels in CSV format locally. The loader expects an image CSV with `pixels`, and a label CSV with `Usage`, the eight emotion vote columns (`neutral`, `happiness`, `surprise`, `sadness`, `anger`, `disgust`, `fear`, `contempt`), and optionally `unknown` and `NF`. If both files share `image_id` or `id`, they are joined by that field. For files aligned by row order, set `allow_positional_join=True`; row counts must match.
 
-The raw image CSV is excluded from Git by `.gitignore`. The loader defaults to a deterministic 70/15/15 stratified split, tie filtering, and perceptual-hash deduplication. Set `use_stratify=False` to use the original `Usage` partitions. `return_soft_labels=True` and `return_sample_weights=True` expose the corresponding training targets and weights.
+The raw image CSV is excluded from Git by `.gitignore`. The loader defaults to a deterministic 70/15/15 stratified split, tie filtering, and perceptual-hash deduplication. Use `split_mode="original_usage"` to retain FER2013's `Training`, `PublicTest`, and `PrivateTest` partitions after filtering and global deduplication. `return_soft_labels=True` and `return_sample_weights=True` expose the corresponding training targets and weights.
 
-Set `split_manifest_dir` to write split manifests and a deduplication report. Use `load_split_from_manifest` to reload a recorded split. The shared preprocessing applies CLAHE to 48×48 grayscale images and scales values to [-1, 1].
+Set `split_manifest_dir` to write split manifests and a deduplication report. Use `load_split_from_manifest` to reload a recorded split. The shared preprocessing resizes grayscale images to the configured input size, applies CLAHE, and scales values to [-1, 1]. Evaluation helpers also provide expected calibration error, temperature fitting, and attention consistency loss.
 
 Example:
 

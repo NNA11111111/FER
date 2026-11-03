@@ -12,7 +12,7 @@ import sklearn
 import torch
 from sklearn.model_selection import train_test_split
 
-from preprocessing import PREPROCESSING_CONFIG, preprocess_fer_gray_48x48
+from preprocessing import PREPROCESSING_CONFIG, preprocess_fer_gray
 
 EMOTION_COLS = [
     "neutral", "happiness", "surprise", "sadness",
@@ -268,11 +268,14 @@ def _evaluate_row_validity(
         and max_vote >= 3.0
     )
     if is_tie and drop_ties and not rescue_tie_for_train:
+        soft_probs = votes / total_votes
         return {
             "is_valid": False,
             "reject_reason": "ties",
             "max_vote": max_vote,
             "hard_label": raw_hard_label,
+            "soft_probs": soft_probs,
+            "sample_w": compute_crowd_sample_weight(soft_probs, total_votes, unknown_votes, nf_votes),
             "usage": usage,
         }
 
@@ -315,8 +318,10 @@ def load_fer2013_csv(
     drop_ties=True,
     retain_rare_ties_in_train=False,
     rare_class_indices=(5, 6, 7),
-    val_size=0.15,
-    test_size=0.15,
+    val_size=0.30,
+    test_size=0.10,
+    split_mode="stratified",
+    return_tie_eval=False,
     random_state=42,
     split_manifest_dir=None,
     allow_positional_join=False,
@@ -331,8 +336,12 @@ def load_fer2013_csv(
        - Tầng 2 (cụm dHash 64-bit có xác nhận sai khác pixel gốc 48x48): chọn đại diện tất định tương tự.
     3. Chia tập bằng Stratified Split 2 bước theo tỷ lệ 70% Train / 15% Validation / 15% Test với khóa `y_hard`.
     """
-    if not use_stratify:
-        raise ValueError("Yêu cầu dự án bắt buộc stratify")
+    if split_mode not in {"stratified", "original_usage"}:
+        raise ValueError("split_mode phải là 'stratified' hoặc 'original_usage'.")
+    if split_mode == "stratified" and not use_stratify:
+        raise ValueError("Yêu cầu dự án bắt buộc stratify trong split_mode='stratified'.")
+    if return_tie_eval and split_mode != "original_usage":
+        raise ValueError("return_tie_eval=True chỉ dùng với split_mode='original_usage'.")
 
     if not drop_ties:
         warnings.warn(
@@ -579,7 +588,7 @@ def load_fer2013_csv(
     usage_rare_ties, ids_rare_ties, src_idx_rare_ties, img_name_rare_ties = [], [], [], []
 
     for cand in kept_candidates:
-        norm_img = preprocess_fer_gray_48x48(cand["raw_img"])[..., np.newaxis]
+        norm_img = preprocess_fer_gray(cand["raw_img"], target_size=PREPROCESSING_CONFIG["target_size"])[..., np.newaxis]
         if cand["is_rescued"]:
             X_rare_ties.append(norm_img)
             y_soft_rare_ties.append(cand["soft_probs"])
@@ -609,94 +618,115 @@ def load_fer2013_csv(
     src_idx_all = np.asarray(src_idx_all, dtype=np.int64)
     img_name_all = np.asarray(img_name_all)
 
-    # --- BƯỚC 3: CHIA TẬP STRATIFIED 70/15/15 THEO KHÓA DUY NHẤT Y_HARD ---
-    holdout_size = val_size + test_size
-    if not (0.0 < holdout_size < 1.0):
-        raise ValueError(f"Tổng val_size + test_size phải nằm trong (0, 1), nhận được {holdout_size}.")
-
-    num_classes = len(EMOTION_COLS)
-    counts_before_split = np.bincount(y_hard_all, minlength=num_classes)
-    if np.any(counts_before_split < 3):
-        too_small = {LABEL_NAMES[i]: int(n) for i, n in enumerate(counts_before_split) if n < 3}
-        raise ValueError(
-            "Không đủ mẫu để chia train/val/test với stratify. "
-            f"Lớp có dưới 3 mẫu: {too_small}"
-        )
-
-    if use_multilabel_stratify:
-        stratify_keys_step1 = build_multilabel_stratify_keys(
-            y_soft_all, y_hard_all, min_count_per_key=max(4, int(round(2.0 / min(val_size, test_size))))
-        )
-        strat_desc = "Multi-label Composite Stratification (Tùy chọn)"
+    if split_mode == "original_usage":
+        split_indices = {
+            "train": np.flatnonzero(usage_all == "Training"),
+            "val": np.flatnonzero(usage_all == "PublicTest"),
+            "test": np.flatnonzero(usage_all == "PrivateTest"),
+        }
+        if any(len(indices) == 0 for indices in split_indices.values()):
+            raise ValueError("Chế độ original_usage cần đủ Training, PublicTest và PrivateTest sau lọc/khử trùng.")
+        (train_idx, val_idx, test_idx) = (split_indices["train"], split_indices["val"], split_indices["test"])
+        def select_split(indices):
+            return (X_all[indices], y_soft_all[indices], y_hard_all[indices], w_all[indices],
+                    ids_all[indices], src_idx_all[indices], img_name_all[indices], usage_all[indices])
+        (X_train, y_train_soft, y_train_hard, w_train, ids_train, src_train, name_train, usage_train) = select_split(train_idx)
+        (X_val, y_val_soft, y_val_hard, w_val, ids_val, src_val, name_val, usage_val) = select_split(val_idx)
+        (X_test, y_test_soft, y_test_hard, w_test, ids_test, src_test, name_test, usage_test) = select_split(test_idx)
+        holdout_size = (len(val_idx) + len(test_idx)) / len(X_all)
+        train_pct = int(round(100 * len(train_idx) / len(X_all)))
+        val_pct = int(round(100 * len(val_idx) / len(X_all)))
+        test_pct = int(round(100 * len(test_idx) / len(X_all)))
+        split_method_str = f"Usage gốc, khử trùng toàn cục ({train_pct}/{val_pct}/{test_pct})"
     else:
-        stratify_keys_step1 = y_hard_all
-        strat_desc = "Stratify theo nhãn cảm xúc chính (y_hard)"
+        # --- BƯỚC 3: CHIA TẬP STRATIFIED 70/15/15 THEO KHÓA DUY NHẤT Y_HARD ---
+        holdout_size = val_size + test_size
+        if not (0.0 < holdout_size < 1.0):
+            raise ValueError(f"Tổng val_size + test_size phải nằm trong (0, 1), nhận được {holdout_size}.")
 
-    # Lần chia 1: Train (70%) và Temp (30%)
-    (
-        X_train, X_temp,
-        y_train_soft, y_temp_soft,
-        y_train_hard, y_temp_hard,
-        w_train, w_temp,
-        ids_train, ids_temp,
-        src_train, src_temp,
-        name_train, name_temp,
-        usage_train, usage_temp,
-    ) = train_test_split(
-        X_all, y_soft_all, y_hard_all, w_all,
-        ids_all, src_idx_all, img_name_all, usage_all,
-        test_size=holdout_size,
-        random_state=random_state,
-        stratify=stratify_keys_step1,
-    )
+        num_classes = len(EMOTION_COLS)
+        counts_before_split = np.bincount(y_hard_all, minlength=num_classes)
+        if np.any(counts_before_split < 3):
+            too_small = {LABEL_NAMES[i]: int(n) for i, n in enumerate(counts_before_split) if n < 3}
+            raise ValueError(
+                "Không đủ mẫu để chia train/val/test với stratify. "
+                f"Lớp có dưới 3 mẫu: {too_small}"
+            )
 
-    train_counts_step1 = np.bincount(y_train_hard, minlength=num_classes)
-    temp_counts_step1 = np.bincount(y_temp_hard, minlength=num_classes)
-    if np.any(train_counts_step1 < 1) or np.any(temp_counts_step1 < 1):
-        missing_info = {
-            LABEL_NAMES[i]: {"train": int(train_counts_step1[i]), "temp": int(temp_counts_step1[i])}
-            for i in range(num_classes)
-            if train_counts_step1[i] < 1 or temp_counts_step1[i] < 1
-        }
-        raise ValueError(f"Sau lần chia 1, có lớp thiếu mẫu ở train hoặc temp: {missing_info}")
+        if use_multilabel_stratify:
+            stratify_keys_step1 = build_multilabel_stratify_keys(
+                y_soft_all, y_hard_all, min_count_per_key=max(4, int(round(2.0 / min(val_size, test_size))))
+            )
+            strat_desc = "Multi-label Composite Stratification (Tùy chọn)"
+        else:
+            stratify_keys_step1 = y_hard_all
+            strat_desc = "Stratify theo nhãn cảm xúc chính (y_hard)"
 
-    if np.any(temp_counts_step1 < 2):
-        too_small_temp = {LABEL_NAMES[i]: int(n) for i, n in enumerate(temp_counts_step1) if n < 2}
-        raise ValueError(f"Tập temp có lớp dưới 2 mẫu nên không thể stratify val/test: {too_small_temp}")
+        # Lần chia 1: Train (70%) và Temp (30%)
+        (
+            X_train, X_temp,
+            y_train_soft, y_temp_soft,
+            y_train_hard, y_temp_hard,
+            w_train, w_temp,
+            ids_train, ids_temp,
+            src_train, src_temp,
+            name_train, name_temp,
+            usage_train, usage_temp,
+        ) = train_test_split(
+            X_all, y_soft_all, y_hard_all, w_all,
+            ids_all, src_idx_all, img_name_all, usage_all,
+            test_size=holdout_size,
+            random_state=random_state,
+            stratify=stratify_keys_step1,
+        )
 
-    # Lần chia 2: Val (15%) và Test (15%) dùng khóa y_hard
-    test_ratio_in_temp = test_size / holdout_size
-    (
-        X_val, X_test,
-        y_val_soft, y_test_soft,
-        y_val_hard, y_test_hard,
-        w_val, w_test,
-        ids_val, ids_test,
-        src_val, src_test,
-        name_val, name_test,
-        usage_val, usage_test,
-    ) = train_test_split(
-        X_temp, y_temp_soft, y_temp_hard, w_temp,
-        ids_temp, src_temp, name_temp, usage_temp,
-        test_size=test_ratio_in_temp,
-        random_state=random_state,
-        stratify=y_temp_hard,
-    )
+        train_counts_step1 = np.bincount(y_train_hard, minlength=num_classes)
+        temp_counts_step1 = np.bincount(y_temp_hard, minlength=num_classes)
+        if np.any(train_counts_step1 < 1) or np.any(temp_counts_step1 < 1):
+            missing_info = {
+                LABEL_NAMES[i]: {"train": int(train_counts_step1[i]), "temp": int(temp_counts_step1[i])}
+                for i in range(num_classes)
+                if train_counts_step1[i] < 1 or temp_counts_step1[i] < 1
+            }
+            raise ValueError(f"Sau lần chia 1, có lớp thiếu mẫu ở train hoặc temp: {missing_info}")
 
-    val_counts_step2 = np.bincount(y_val_hard, minlength=num_classes)
-    test_counts_step2 = np.bincount(y_test_hard, minlength=num_classes)
-    if np.any(val_counts_step2 < 1) or np.any(test_counts_step2 < 1):
-        missing_info_2 = {
-            LABEL_NAMES[i]: {"val": int(val_counts_step2[i]), "test": int(test_counts_step2[i])}
-            for i in range(num_classes)
-            if val_counts_step2[i] < 1 or test_counts_step2[i] < 1
-        }
-        raise ValueError(f"Sau lần chia 2, có lớp thiếu mẫu ở val hoặc test: {missing_info_2}")
+        if np.any(temp_counts_step1 < 2):
+            too_small_temp = {LABEL_NAMES[i]: int(n) for i, n in enumerate(temp_counts_step1) if n < 2}
+            raise ValueError(f"Tập temp có lớp dưới 2 mẫu nên không thể stratify val/test: {too_small_temp}")
 
-    train_pct = int(round((1.0 - holdout_size) * 100))
-    val_pct = int(round(val_size * 100))
-    test_pct = int(round(test_size * 100))
-    split_method_str = f"{strat_desc} ({train_pct}/{val_pct}/{test_pct}, random_state={random_state})"
+        # Lần chia 2: Val (15%) và Test (15%) dùng khóa y_hard
+        test_ratio_in_temp = test_size / holdout_size
+        (
+            X_val, X_test,
+            y_val_soft, y_test_soft,
+            y_val_hard, y_test_hard,
+            w_val, w_test,
+            ids_val, ids_test,
+            src_val, src_test,
+            name_val, name_test,
+            usage_val, usage_test,
+        ) = train_test_split(
+            X_temp, y_temp_soft, y_temp_hard, w_temp,
+            ids_temp, src_temp, name_temp, usage_temp,
+            test_size=test_ratio_in_temp,
+            random_state=random_state,
+            stratify=y_temp_hard,
+        )
+
+        val_counts_step2 = np.bincount(y_val_hard, minlength=num_classes)
+        test_counts_step2 = np.bincount(y_test_hard, minlength=num_classes)
+        if np.any(val_counts_step2 < 1) or np.any(test_counts_step2 < 1):
+            missing_info_2 = {
+                LABEL_NAMES[i]: {"val": int(val_counts_step2[i]), "test": int(test_counts_step2[i])}
+                for i in range(num_classes)
+                if val_counts_step2[i] < 1 or test_counts_step2[i] < 1
+            }
+            raise ValueError(f"Sau lần chia 2, có lớp thiếu mẫu ở val hoặc test: {missing_info_2}")
+
+        train_pct = int(round((1.0 - holdout_size) * 100))
+        val_pct = int(round(val_size * 100))
+        test_pct = int(round(test_size * 100))
+        split_method_str = f"{strat_desc} ({train_pct}/{val_pct}/{test_pct}, random_state={random_state})"
 
     y_train_stratified_clean = y_train_hard.copy()
 
@@ -720,6 +750,35 @@ def load_fer2013_csv(
         src_train = src_train[perm]
         name_train = name_train[perm]
         usage_train = usage_train[perm]
+
+    tie_eval_X, tie_eval_soft, tie_eval_hard = [], [], []
+    if return_tie_eval:
+        kept_exact_ids = {c["image_id"] for c in kept_candidates}
+        kept_hashes = [(c["dhash"], c["raw_img"]) for c in kept_candidates if c["dhash"]]
+        for _, tie_row in df_after_exact.iterrows():
+            tie_eval = tie_row["_eval_obj"]
+            if tie_eval["reject_reason"] != "ties" or str(tie_row["Usage"]).strip() != "PrivateTest":
+                continue
+            image_id = str(tie_row["image_id"])
+            if image_id in kept_exact_ids:
+                continue
+            raw = np.fromstring(str(tie_row["pixels"]), sep=" ", dtype=np.uint8).reshape(48, 48)
+            dhash = compute_dhash(raw) if use_perceptual_dedup else ""
+            if dhash and any(
+                hamming_distance_hex(dhash, old_hash) <= near_dup_hamming
+                and float(np.mean(np.abs(raw.astype(np.float32) - old_img.astype(np.float32))))
+                <= float(near_dup_pixel_mad_threshold)
+                for old_hash, old_img in kept_hashes
+            ):
+                continue
+            tie_eval_X.append(preprocess_fer_gray(raw, target_size=PREPROCESSING_CONFIG["target_size"])[..., None])
+            tie_eval_soft.append(tie_eval["soft_probs"])
+            tie_eval_hard.append(tie_eval["hard_label"])
+        tie_eval_data = (
+            np.asarray(tie_eval_X, dtype=np.float32),
+            np.asarray(tie_eval_soft, dtype=np.float32).reshape(-1, len(EMOTION_COLS)),
+            np.asarray(tie_eval_hard, dtype=np.int64),
+        )
 
     # --- BƯỚC 4: KIỂM TRA HẬU ĐIỀU KIỆN (POST-CONDITIONS ASSERTS & BẢNG PHÂN PHỐI) ---
     set_ids_train, set_ids_val, set_ids_test = set(ids_train), set(ids_val), set(ids_test)
@@ -747,23 +806,24 @@ def load_fer2013_csv(
         assert len(s_y_soft) == n_s and len(s_y_hard) == n_s and len(s_w) == n_s and len(s_ids) == n_s, (
             f"Độ dài các mảng trong tập {s_name} không khớp nhau!"
         )
-        c_s = np.bincount(s_y_hard, minlength=num_classes)
-        assert np.all(c_s >= 1), f"Tập {s_name} có lớp không có mẫu nào: {c_s.tolist()}"
+        if split_mode == "stratified":
+            c_s = np.bincount(s_y_hard, minlength=num_classes)
+            assert np.all(c_s >= 1), f"Tập {s_name} có lớp không có mẫu nào: {c_s.tolist()}"
 
     actual_train_ratio = len(X_train) / total_in_splits * 100.0
     actual_val_ratio = len(X_val) / total_in_splits * 100.0
     actual_test_ratio = len(X_test) / total_in_splits * 100.0
-    expected_train_ratio = (1.0 - holdout_size) * 100.0
-    expected_val_ratio = val_size * 100.0
-    expected_test_ratio = test_size * 100.0
-
-    assert abs(actual_val_ratio - expected_val_ratio) <= 0.5, (
-        f"Tỷ lệ tập Val ({actual_val_ratio:.2f}%) lệch quá 0.5 điểm % so với {expected_val_ratio:.2f}%!"
-    )
-    assert abs(actual_test_ratio - expected_test_ratio) <= 0.5, (
-        f"Tỷ lệ tập Test ({actual_test_ratio:.2f}%) lệch quá 0.5 điểm % so với {expected_test_ratio:.2f}%!"
-    )
-    if not retain_rare_ties_in_train:
+    if split_mode == "stratified":
+        expected_train_ratio = (1.0 - holdout_size) * 100.0
+        expected_val_ratio = val_size * 100.0
+        expected_test_ratio = test_size * 100.0
+        assert abs(actual_val_ratio - expected_val_ratio) <= 0.5, (
+            f"Tỷ lệ tập Val ({actual_val_ratio:.2f}%) lệch quá 0.5 điểm % so với {expected_val_ratio:.2f}%!"
+        )
+        assert abs(actual_test_ratio - expected_test_ratio) <= 0.5, (
+            f"Tỷ lệ tập Test ({actual_test_ratio:.2f}%) lệch quá 0.5 điểm % so với {expected_test_ratio:.2f}%!"
+        )
+    if split_mode == "stratified" and not retain_rare_ties_in_train:
         assert abs(actual_train_ratio - expected_train_ratio) <= 0.5, (
             f"Tỷ lệ tập Train ({actual_train_ratio:.2f}%) lệch quá 0.5 điểm % so với {expected_train_ratio:.2f}%!"
         )
@@ -786,7 +846,12 @@ def load_fer2013_csv(
 
     # Kiểm tra theo SỐ MẪU: abs(count_s[i] - total[i] * n_s / N) <= 2.0
     # Khi retain_rare_ties_in_train=True, bỏ qua tập Train và đối chiếu Val/Test với tập mẫu chuẩn trước khi cộng rare-ties
-    if retain_rare_ties_in_train:
+    if split_mode != "stratified":
+        N_ref = total_in_splits
+        total_ref = c_total
+        pct_ref = pct_total
+        splits_to_check = []
+    elif retain_rare_ties_in_train:
         N_ref = len(y_hard_all)
         total_ref = counts_before_split
         pct_ref = total_ref / N_ref * 100.0
@@ -870,6 +935,7 @@ def load_fer2013_csv(
                 "return_soft_labels": bool(return_soft_labels),
                 "return_sample_weights": bool(return_sample_weights),
                 "use_stratify": bool(use_stratify),
+                "split_mode": split_mode,
                 "use_multilabel_stratify": bool(use_multilabel_stratify),
                 "use_perceptual_dedup": bool(use_perceptual_dedup),
                 "near_dup_hamming": int(near_dup_hamming),
@@ -977,24 +1043,26 @@ def load_fer2013_csv(
         print(f"  Phân phối chuẩn: {clean_dist}")
 
     if return_soft_labels and return_sample_weights:
-        return (
+        result = (
             (X_train, y_train_soft, y_train_hard, w_train),
             (X_val, y_val_soft, y_val_hard, w_val),
             (X_test, y_test_soft, y_test_hard, w_test),
         )
 
-    if return_soft_labels:
-        return (
+    elif return_soft_labels:
+        result = (
             (X_train, y_train_soft, y_train_hard),
             (X_val, y_val_soft, y_val_hard),
             (X_test, y_test_soft, y_test_hard),
         )
 
-    return (
-        (X_train, y_train_hard),
-        (X_val, y_val_hard),
-        (X_test, y_test_hard),
-    )
+    else:
+        result = (
+            (X_train, y_train_hard),
+            (X_val, y_val_hard),
+            (X_test, y_test_hard),
+        )
+    return (*result, tie_eval_data) if return_tie_eval else result
 
 
 def load_split_from_manifest(
@@ -1124,7 +1192,7 @@ def load_split_from_manifest(
             )
 
             pixels = np.fromstring(str(src_row["pixels"]), sep=" ", dtype=np.uint8).reshape(48, 48)
-            norm_img = preprocess_fer_gray_48x48(pixels)[..., np.newaxis]
+            norm_img = preprocess_fer_gray(pixels, target_size=PREPROCESSING_CONFIG["target_size"])[..., np.newaxis]
 
             X_list.append(norm_img)
             y_soft_list.append(soft_probs)

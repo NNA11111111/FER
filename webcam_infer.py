@@ -9,7 +9,7 @@ import torch.nn.functional as F
 
 from models import CustomCNN
 from eval_utils import apply_posthoc_logit_adjustment
-from preprocessing import preprocess_fer_gray_48x48
+from preprocessing import PREPROCESSING_CONFIG, preprocess_fer_gray
 
 EMOTION_DICT = {
     0: "Neutral",
@@ -52,18 +52,14 @@ def shrink_face_bbox(x, y, w, h, frame_shape, crop_margin_shrink=0.0):
 def preprocess_live_frame(face_crop):
     """
     Áp dụng chính xác hàm tiền xử lý dùng chung `preprocess_fer_gray_48x48` cho khung ảnh cắt từ Webcam:
-    Grayscale -> Resize(48, 48, INTER_AREA khi thu nhỏ) -> preprocess_fer_gray_48x48 (CLAHE + Norm [-1, 1]).
+    Grayscale -> Resize theo PREPROCESSING_CONFIG -> CLAHE + chuẩn hóa [-1, 1].
     """
     if len(face_crop.shape) == 3:
         face_gray = cv2.cvtColor(face_crop, cv2.COLOR_BGR2GRAY)
     else:
         face_gray = face_crop
 
-    h, w = face_gray.shape[:2]
-    interp = cv2.INTER_AREA if (h > 48 or w > 48) else cv2.INTER_LINEAR
-    face_resized = cv2.resize(face_gray, (48, 48), interpolation=interp)
-
-    X_norm = preprocess_fer_gray_48x48(face_resized)
+    X_norm = preprocess_fer_gray(face_gray, target_size=PREPROCESSING_CONFIG["target_size"])
     tensor_img = torch.tensor(X_norm, dtype=torch.float32).unsqueeze(0).unsqueeze(0)
     return tensor_img
 
