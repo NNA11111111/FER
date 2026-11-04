@@ -67,10 +67,10 @@ class FER2013Dataset(Dataset):
         target = self.y[idx]
         if getattr(target, "ndim", 0) > 0:
             label = torch.tensor(target, dtype=torch.float32)
-            primary_classes = set(np.flatnonzero(target == np.max(target)).tolist())
+            primary_cls = int(np.argmax(target))
         else:
             label = torch.tensor(target, dtype=torch.long)
-            primary_classes = {int(target)}
+            primary_cls = int(target)
 
         if self.is_train and self.spatial_transform is not None:
             img_tensor = self.spatial_transform(img_tensor)
@@ -78,7 +78,7 @@ class FER2013Dataset(Dataset):
             if (
                 self.erasing_enabled
                 and self.erasing_transform is not None
-                and not (primary_classes & self.rare_classes)
+                and primary_cls not in self.rare_classes
             ):
                 img_tensor = self.erasing_transform(img_tensor)
 
@@ -128,11 +128,11 @@ def mixup_soft_batch(
     batch_size = images.size(0)
     index = torch.randperm(batch_size, device=images.device)
 
-    top_mass = soft_labels.max(dim=1).values
+    hard_labels = soft_labels.argmax(dim=1)
     is_rare = torch.zeros(batch_size, dtype=torch.bool, device=images.device)
     if rare_classes is not None:
         for rc in rare_classes:
-            is_rare |= (soft_labels[:, int(rc)] == top_mass)
+            is_rare |= (hard_labels == int(rc))
 
     # Nếu mẫu hiện tại thuộc lớp hiếm (Disgust, Fear, Contempt) -> đặt lam = 1.0 (không pha trộn)
     lam_vec = torch.where(
