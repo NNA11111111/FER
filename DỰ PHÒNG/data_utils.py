@@ -206,6 +206,22 @@ def _join_and_validate_sources(df_img: pd.DataFrame, df_label: pd.DataFrame, all
     return df
 
 
+def resolve_reference_label(votes, source_row_index, policy="argmax", seed=42):
+    """Reference label for stratification/metrics; soft targets remain unchanged.
+
+    seeded breaks a top-vote tie reproducibly without preferring low class IDs.
+    It is a declared reference convention, not a uniquely correct label for a tie.
+    """
+    tied = np.flatnonzero(votes == np.max(votes))
+    if policy == "argmax" or len(tied) == 1:
+        return int(tied[0])
+    if policy != "seeded":
+        raise ValueError(f"Unknown tie reference policy: {policy}")
+    key = f"{int(seed)}:{int(source_row_index)}".encode("utf-8")
+    local_seed = int.from_bytes(hashlib.sha256(key).digest()[:8], "big")
+    return int(np.random.default_rng(local_seed).choice(tied))
+
+
 def _evaluate_row_validity(
     row,
     has_unknown_col: bool,
@@ -214,6 +230,8 @@ def _evaluate_row_validity(
     rare_set: set,
     drop_ties: bool,
     retain_rare_ties_in_train: bool,
+    tie_reference_policy="argmax",
+    tie_reference_seed=42,
 ):
     """
     Đánh giá tính hợp lệ của một dòng dữ liệu theo quy tắc lọc FER+:
@@ -228,7 +246,9 @@ def _evaluate_row_validity(
     votes[votes <= 1.0] = 0.0
     total_votes = float(votes.sum())
     max_vote = float(votes.max())
-    raw_hard_label = int(np.argmax(votes))
+    raw_hard_label = resolve_reference_label(
+        votes, row["source_row_index"], tie_reference_policy, tie_reference_seed
+    )
 
     if usage not in valid_usages:
         return {
@@ -320,6 +340,7 @@ def load_fer2013_csv(
     random_state=42,
     split_manifest_dir=None,
     allow_positional_join=False,
+    tie_reference_policy="argmax",
 ):
     """
     Đọc, làm sạch và chia tập bộ dữ liệu FER2013 kết hợp nhãn đám đông FER+ (Barsoum et al., ICMI 2016):
@@ -334,11 +355,10 @@ def load_fer2013_csv(
     if not use_stratify:
         raise ValueError("Yêu cầu dự án bắt buộc stratify")
 
-    if not drop_ties:
-        warnings.warn(
-            "CẢNH BÁO: drop_ties=False khiến các mẫu hòa phiếu cao nhất được gán nhãn cứng bằng np.argmax, "
-            "gây thiên lệch về các lớp có chỉ số nhỏ (ví dụ: Neutral=0, Happiness=1)."
-        )
+    if retain_rare_ties_in_train:
+        raise ValueError("All filtering must finish BEFORE splitting; post-split tie rescue is disabled.")
+    if tie_reference_policy not in {"argmax", "seeded"}:
+        raise ValueError("tie_reference_policy must be argmax or seeded")
 
     df_img = pd.read_csv(img_csv_path)
     df_label = pd.read_csv(label_csv_path)
@@ -374,6 +394,8 @@ def load_fer2013_csv(
             rare_set=rare_set,
             drop_ties=drop_ties,
             retain_rare_ties_in_train=retain_rare_ties_in_train,
+            tie_reference_policy=tie_reference_policy,
+            tie_reference_seed=random_state,
         )
         for _, row in df.iterrows()
     ]
@@ -700,27 +722,6 @@ def load_fer2013_csv(
 
     y_train_stratified_clean = y_train_hard.copy()
 
-    if len(X_rare_ties) > 0:
-        X_train = np.concatenate([X_train, np.asarray(X_rare_ties, dtype=np.float32)], axis=0)
-        y_train_soft = np.concatenate([y_train_soft, np.asarray(y_soft_rare_ties, dtype=np.float32)], axis=0)
-        y_train_hard = np.concatenate([y_train_hard, np.asarray(y_hard_rare_ties, dtype=np.int64)], axis=0)
-        w_train = np.concatenate([w_train, np.asarray(w_rare_ties, dtype=np.float32)], axis=0)
-        ids_train = np.concatenate([ids_train, np.asarray(ids_rare_ties)])
-        src_train = np.concatenate([src_train, np.asarray(src_idx_rare_ties, dtype=np.int64)])
-        name_train = np.concatenate([name_train, np.asarray(img_name_rare_ties)])
-        usage_train = np.concatenate([usage_train, np.asarray(usage_rare_ties)])
-
-        rng = np.random.RandomState(random_state)
-        perm = rng.permutation(len(X_train))
-        X_train = X_train[perm]
-        y_train_soft = y_train_soft[perm]
-        y_train_hard = y_train_hard[perm]
-        w_train = w_train[perm]
-        ids_train = ids_train[perm]
-        src_train = src_train[perm]
-        name_train = name_train[perm]
-        usage_train = usage_train[perm]
-
     # --- BƯỚC 4: KIỂM TRA HẬU ĐIỀU KIỆN (POST-CONDITIONS ASSERTS & BẢNG PHÂN PHỐI) ---
     set_ids_train, set_ids_val, set_ids_test = set(ids_train), set(ids_val), set(ids_test)
     assert set_ids_train.isdisjoint(set_ids_val), "Rò rỉ image_id giữa Train và Val!"
@@ -757,21 +758,12 @@ def load_fer2013_csv(
     expected_val_ratio = val_size * 100.0
     expected_test_ratio = test_size * 100.0
 
-    assert abs(actual_val_ratio - expected_val_ratio) <= 0.5, (
-        f"Tỷ lệ tập Val ({actual_val_ratio:.2f}%) lệch quá 0.5 điểm % so với {expected_val_ratio:.2f}%!"
-    )
-    assert abs(actual_test_ratio - expected_test_ratio) <= 0.5, (
-        f"Tỷ lệ tập Test ({actual_test_ratio:.2f}%) lệch quá 0.5 điểm % so với {expected_test_ratio:.2f}%!"
-    )
-    if not retain_rare_ties_in_train:
-        assert abs(actual_train_ratio - expected_train_ratio) <= 0.5, (
-            f"Tỷ lệ tập Train ({actual_train_ratio:.2f}%) lệch quá 0.5 điểm % so với {expected_train_ratio:.2f}%!"
-        )
-    else:
-        print(
-            "[GHI CHÚ HẬU ĐIỀU KIỆN] retain_rare_ties_in_train=True: Bỏ qua kiểm tra tỷ lệ của tập Train "
-            "(vì các mẫu rare-ties thu hồi chỉ được cộng thêm vào tập Train)."
-        )
+    for split_name, actual, fraction in (
+        ("train", len(X_train), 1.0 - holdout_size),
+        ("val", len(X_val), val_size), ("test", len(X_test), test_size),
+    ):
+        if abs(actual - total_in_splits * fraction) > 1.0 + 1e-9:
+            raise ValueError(f"{split_name}: split differs from requested ratio by more than one image")
 
     total_labels_combined = np.concatenate([y_train_hard, y_val_hard, y_test_hard])
     c_total = np.bincount(total_labels_combined, minlength=num_classes)
@@ -865,7 +857,37 @@ def load_fer2013_csv(
         all_splits_df = pd.concat(split_dfs, ignore_index=True)
         all_splits_df.to_csv(manifest_dir / "all_splits.csv", index=False)
 
+        split_lookup = dict(zip(all_splits_df.source_row_index, all_splits_df.split))
+        dedup_lookup = {int(r["dropped_source_row_index"]): r for r in dedup_records}
+        audit_rows = []
+        for _, row in df.iterrows():
+            src = int(row["source_row_index"])
+            ev = row["_eval_obj"]
+            votes = row[EMOTION_COLS].to_numpy(dtype=np.float32).copy()
+            votes[votes <= 1] = 0
+            tied = np.flatnonzero(votes == votes.max()) if votes.sum() else np.array([], dtype=int)
+            duplicate = dedup_lookup.get(src)
+            status = "kept" if src in split_lookup else (
+                "duplicate_" + duplicate["reason"] if duplicate else ev["reject_reason"] or "not_kept"
+            )
+            audit_rows.append(dict(source_row_index=src, image_id=row["image_id"],
+                status=status, split=split_lookup.get(src, ""), is_tie=len(tied)>1,
+                tied_classes=" ".join(map(str, tied)), reference_label=ev["hard_label"],
+                representative_source_row_index=duplicate["rep_source_row_index"] if duplicate else None))
+        audit_df = pd.DataFrame(audit_rows)
+        audit_df.to_csv(manifest_dir / "filtering_report.csv", index=False)
+        audit_df[audit_df.is_tie].to_csv(manifest_dir / "tie_analysis.csv", index=False)
+        distribution = []
+        for name, soft, hard in [("all_clean", y_soft_all, y_hard_all),
+                ("train", y_train_soft, y_train_hard), ("val", y_val_soft, y_val_hard),
+                ("test", y_test_soft, y_test_hard)]:
+            for c, label in enumerate(LABEL_NAMES):
+                distribution.append(dict(split=name, label=label, hard_count=int((hard==c).sum()),
+                    soft_mass=float(soft[:,c].sum()), images_with_votes=int((soft[:,c]>0).sum())))
+        pd.DataFrame(distribution).to_csv(manifest_dir / "class_distribution.csv", index=False)
+
         split_config = {
+            "split_policy": "clean_all_then_stratified_holdout",
             "parameters": {
                 "return_soft_labels": bool(return_soft_labels),
                 "return_sample_weights": bool(return_sample_weights),
@@ -875,6 +897,8 @@ def load_fer2013_csv(
                 "near_dup_hamming": int(near_dup_hamming),
                 "near_dup_pixel_mad_threshold": float(near_dup_pixel_mad_threshold),
                 "drop_ties": bool(drop_ties),
+                "tie_reference_policy": tie_reference_policy,
+                "tie_reference_seed": int(random_state),
                 "retain_rare_ties_in_train": bool(retain_rare_ties_in_train),
                 "rare_class_indices": list(rare_class_indices) if rare_class_indices is not None else [],
                 "val_size": float(val_size),
@@ -1018,6 +1042,8 @@ def load_split_from_manifest(
         with open(config_path, "r", encoding="utf-8") as f:
             cfg = json.load(f)
         params = cfg.get("parameters", {})
+        tie_reference_policy = params.get("tie_reference_policy", "argmax")
+        tie_reference_seed = params.get("tie_reference_seed", params.get("random_state", 42))
         drop_ties = bool(params.get("drop_ties", True))
         retain_rare_ties = bool(params.get("retain_rare_ties_in_train", False))
         rare_set = set(params.get("rare_class_indices", [5, 6, 7]))
@@ -1042,6 +1068,8 @@ def load_split_from_manifest(
             raise FileNotFoundError(
                 f"Không tìm thấy {config_path} để xác minh SHA-256 của file nguồn (verify_source_hash=True)."
             )
+        tie_reference_policy = "argmax"
+        tie_reference_seed = 42
         drop_ties = True
         retain_rare_ties = False
         rare_set = {5, 6, 7}
@@ -1104,7 +1132,9 @@ def load_split_from_manifest(
                     soft_probs, total_votes, unknown_votes, nf_votes, is_rescued_tie=True, min_weight=0.20
                 )
             else:
-                hard_label = int(np.argmax(votes))
+                hard_label = resolve_reference_label(
+                    votes, src_idx, tie_reference_policy, tie_reference_seed
+                )
                 sample_w = compute_crowd_sample_weight(
                     soft_probs, total_votes, unknown_votes, nf_votes, is_rescued_tie=False
                 )
@@ -1140,113 +1170,6 @@ def load_split_from_manifest(
 
     return tuple(reconstructed)
 
-def extend_train_with_ties(img_csv, label_csv, baseline_dir, output_dir):
-    """Freeze baseline splits; append valid ties to train, excluding duplicate images.
-
-    label_id remains a compatibility/display field for ties; training uses soft_label.
-    The legacy filtering and weighting rules are intentionally preserved.
-    """
-    import shutil
-    baseline_dir, output_dir = Path(baseline_dir), Path(output_dir)
-    if baseline_dir.resolve() == output_dir.resolve():
-        raise ValueError('Output must differ from baseline directory')
-    load_split_from_manifest(img_csv, label_csv, baseline_dir)  # Validate baseline before extending
-    cfg = json.loads((baseline_dir / 'split_config.json').read_text(encoding='utf-8'))
-    if not cfg['parameters'].get('drop_ties', True) or cfg['parameters'].get('retain_rare_ties_in_train', False):
-        raise ValueError('Expected the original drop-ties baseline')
-    if cfg.get('preprocessing_config') != PREPROCESSING_CONFIG:
-        raise ValueError('Baseline preprocessing differs from current preprocessing')
-    output_dir.mkdir(parents=True, exist_ok=True)
-    frames = [pd.read_csv(baseline_dir / f'{s}_ids.csv') for s in ('train', 'val', 'test')]
-    old = pd.concat(frames, ignore_index=True)
-    if old.image_id.duplicated().any() or old.source_row_index.duplicated().any():
-        raise ValueError('Baseline splits contain duplicate IDs')
-    df = _join_and_validate_sources(pd.read_csv(img_csv), pd.read_csv(label_csv), True)
-    raw = [np.fromstring(str(p), sep=' ', dtype=np.uint8).reshape(48, 48) for p in df.pixels]
-    hashes = [hashlib.sha256(' '.join(str(p).strip().split()).encode()).hexdigest() for p in df.pixels]
-    dhashes = [compute_dhash(im) for im in raw]
-    params = cfg['parameters']
-    radius = int(params.get('near_dup_hamming', 0))
-    mad_limit = float(params.get('near_dup_pixel_mad_threshold', 15.0))
-    use_near = params.get('use_perceptual_dedup', True)
-    known_ids = dict(zip(old.image_id, old.source_row_index.astype(int)))
-    buckets = {}
-    for src in old.source_row_index.astype(int):
-        buckets.setdefault(dhashes[src], []).append(src)
-    evaluations, added, audit, duplicate_rows = [], [], [], []
-    old_sources = set(old.source_row_index.astype(int))
-    for src, row in df.iterrows():
-        ev = _evaluate_row_validity(row, 'unknown' in df, 'NF' in df,
-                                   {'Training', 'PublicTest', 'PrivateTest'}, set(), False, False)
-        votes = row[EMOTION_COLS].to_numpy(dtype=np.float32).copy()
-        votes[votes <= 1] = 0
-        tied = np.flatnonzero(votes == votes.max()) if votes.sum() else np.array([], dtype=int)
-        evaluations.append((src, ev, tied))
-    # Prefer the most strongly voted tie within each new duplicate group.
-    for src, ev, tied in sorted(evaluations, key=lambda item: (-item[1]['max_vote'], item[0])):
-        status = 'baseline' if src in old_sources else (ev['reject_reason'] or 'not_tied')
-        rep, reason = None, None
-        if src not in old_sources and ev['is_valid'] and len(tied) > 1:
-            rep = known_ids.get(hashes[src])
-            reason = 'exact' if rep is not None else None
-            if rep is None and use_near:
-                keys = [dhashes[src]] if radius == 0 else [h for h in buckets if hamming_distance_hex(h, dhashes[src]) <= radius]
-                for key in keys:
-                    for other in buckets.get(key, []):
-                        if np.abs(raw[src].astype(np.int16) - raw[other].astype(np.int16)).mean() <= mad_limit:
-                            rep, reason = other, 'dhash'
-                            break
-                    if rep is not None:
-                        break
-            if rep is not None:
-                status = 'duplicate_' + reason
-                duplicate_rows.append(dict(dropped_source_row_index=src, rep_source_row_index=rep,
-                    reason=reason, hamming_distance=hamming_distance_hex(dhashes[src], dhashes[rep]),
-                    pixel_mad=float(np.abs(raw[src].astype(np.int16)-raw[rep].astype(np.int16)).mean()),
-                    dropped_hard_label=ev['hard_label'], rep_hard_label=int(np.argmax(df.loc[rep, EMOTION_COLS].to_numpy())),
-                    dropped_usage=ev['usage'], rep_usage=str(df.loc[rep, 'Usage'])))
-            else:
-                status = 'added_train'
-                known_ids[hashes[src]] = src
-                buckets.setdefault(dhashes[src], []).append(src)
-                added.append(dict(image_id=hashes[src], source_row_index=src,
-                    image_name=df.loc[src, 'Image name'], label_id=ev['hard_label'],
-                    label_name=LABEL_NAMES[ev['hard_label']], sample_weight=ev['sample_w'],
-                    soft_label=' '.join(f'{v:.9g}' for v in ev['soft_probs']),
-                    usage_original=ev['usage'], split='train'))
-        audit.append(dict(source_row_index=src, image_id=hashes[src], status=status,
-                          is_tie=len(tied)>1, tied_classes=' '.join(map(str, tied)),
-                          representative_source_row_index=rep))
-    added_df = pd.DataFrame(added, columns=frames[0].columns).sort_values('source_row_index')
-    frames[0] = pd.concat([frames[0], added_df], ignore_index=True)
-    for name, frame in zip(('train', 'val', 'test'), frames):
-        if name == 'train':
-            frame.to_csv(output_dir / f'{name}_ids.csv', index=False)
-        else:
-            shutil.copy2(baseline_dir / f'{name}_ids.csv', output_dir / f'{name}_ids.csv')
-    pd.concat(frames, ignore_index=True).to_csv(output_dir / 'all_splits.csv', index=False)
-    dedup = pd.read_csv(baseline_dir / 'dedup_report.csv')
-    # Preserve baseline provenance and distinguish the new extension decisions.
-    dedup['phase'] = 'baseline'
-    extra = pd.DataFrame(duplicate_rows, columns=[c for c in dedup if c != 'phase'])
-    extra['phase'] = 'tie_extension'
-    pd.concat([dedup, extra], ignore_index=True).to_csv(output_dir / 'dedup_report.csv', index=False)
-    audit_df = pd.DataFrame(audit).sort_values('source_row_index')
-    audit_df.to_csv(output_dir / 'filtering_report.csv', index=False)
-    audit_df[audit_df.is_tie].to_csv(output_dir / 'tie_analysis.csv', index=False)
-    counts = []
-    for name, frame in [('baseline_train', old[old.split == 'train']), *zip(('train', 'val', 'test'), frames)]:
-        soft = np.stack([np.fromstring(s, sep=' ') for s in frame.soft_label])
-        for c, label in enumerate(LABEL_NAMES):
-            counts.append(dict(split=name, label=label, hard_count=int((frame.label_id==c).sum()),
-                               soft_mass=float(soft[:, c].sum()), images_with_votes=int((soft[:, c]>0).sum())))
-    pd.DataFrame(counts).to_csv(output_dir / 'class_distribution.csv', index=False)
-    cfg['parameters']['drop_ties'] = False
-    cfg['split_policy'] = 'frozen_baseline_plus_train_ties'
-    cfg['baseline_config_sha256'] = compute_file_sha256(baseline_dir / 'split_config.json')
-    cfg['added_train_ties'] = len(added_df)
-    cfg['remaining_counts_after_each_step'] = {s: len(f) for s, f in zip(('train','val','test'),frames)}
-    cfg['train_class_counts'] = {LABEL_NAMES[c]: int((frames[0].label_id==c).sum()) for c in range(8)}
-    (output_dir / 'split_config.json').write_text(json.dumps(cfg, ensure_ascii=False, indent=2), encoding='utf-8')
-    print(f'Added {len(added_df)} ties to train; validation/test are unchanged.')
-    return load_split_from_manifest(img_csv, label_csv, output_dir)
+def extend_train_with_ties(*args, **kwargs):
+    """Retired: append-after-split violates the required 70/15/15 protocol."""
+    raise RuntimeError("Use load_fer2013_csv(drop_ties=False): clean all data, then stratify 70/15/15.")
