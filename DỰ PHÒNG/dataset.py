@@ -23,9 +23,13 @@ class FER2013Dataset(Dataset):
         erasing_scale=(0.01, 0.04),
         sample_weights=None,
         rare_classes=(5, 6, 7),
+        metric_labels=None,
     ):
         self.X = X
         self.y = y
+        self.metric_labels = metric_labels
+        if metric_labels is not None and len(metric_labels) != len(y):
+            raise ValueError("metric_labels length differs from targets")
         self.is_train = is_train
         self.erasing_enabled = is_train
         self.rare_classes = set(rare_classes) if rare_classes is not None else set()
@@ -80,8 +84,13 @@ class FER2013Dataset(Dataset):
 
         if self.sample_weights is not None:
             weight = torch.tensor(self.sample_weights[idx], dtype=torch.float32)
-            return img_tensor, label, weight
+            result = (img_tensor, label, weight)
+            if self.metric_labels is not None:
+                result += (torch.tensor(self.metric_labels[idx], dtype=torch.long),)
+            return result
 
+        if self.metric_labels is not None:
+            return img_tensor, label, torch.tensor(self.metric_labels[idx], dtype=torch.long)
         return img_tensor, label
 
 
