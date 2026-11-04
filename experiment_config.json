@@ -1,0 +1,13 @@
+{
+  "experiment": "keep_ties",
+  "evaluation_protocol": "single",
+  "seeds": [
+    42,
+    100,
+    2026
+  ],
+  "baseline_bundle_sha256": "fbebf00fe89a29641359c2bbb7e8728c73eadef7e9f461ea686447fe2a868997",
+  "baseline_config_sha256": "bace1d0359133daeb43221e67ebbfb68491b32e341ce85d3e05a6b19e0ff6f8a",
+  "mcnemar": "two-sided exact; overall primary; rare recall Holm-adjusted",
+  "tie_hard_label": "compatibility only; learning and sampling use soft distributions"
+}
